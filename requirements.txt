@@ -1,0 +1,11 @@
+# Runtime dependencies for python_version/
+numpy
+scipy
+sortedcontainers
+joblib
+
+# Testing
+pytest
+
+# Only needed for python_version/tests/visualize_tests.ipynb
+matplotlib

@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 class Prc1:
@@ -92,8 +93,12 @@ class Prc1:
     # sorts by top or bottom if they are both attached on the same side,
     # otherwise sorts arbitrarily
     def __lt__ (self, other):
+        # fast_hop() briefly inserts a Prc1 into a SortedSet before its first
+        # head is set (mid-reattachment); sort unattached objects after
+        # attached ones instead of raising, since that ordering is never
+        # observed outside this transient window
         if self.is_unattached or other.is_unattached:
-            raise RuntimeError("error unbound comparing PRC", self, other)
+            return not self.is_unattached
 
         if self.top_head_is_attached and other.top_head_is_attached:
             return self.binding_site_top < other.binding_site_top
@@ -157,12 +162,15 @@ class Prc1:
         
         elif self.top_head_is_attached:
             # # find closest bottom site
-            closest_bottom_index = np.floor(self.binding_site_top + offset/site_spacing).astype(int)
+            # (plain math.floor instead of np.floor(...).astype(int): this is a
+            # scalar computation called on every rate lookup, and numpy's
+            # per-call dispatch overhead dominates at that scale)
+            closest_bottom_index = math.floor(self.binding_site_top + offset/site_spacing)
             return closest_bottom_index
-        
+
         elif self.bottom_head_is_attached:
             # find closest top site
-            closest_top_index = np.ceil(self.binding_site_bottom - offset/site_spacing).astype(int)
+            closest_top_index = math.ceil(self.binding_site_bottom - offset/site_spacing)
             return closest_top_index
         
         else:
@@ -207,41 +215,61 @@ class Prc1:
         range is [left inclusive, right exclusive)\n
         """
         # get precomputed rates and the index that corresponds to current position
-        rates = self.state.precomputed_rates.copy()
+        # (not copied here: the non-cooperative fast path below never mutates it,
+        # and the cooperative path below copies only once it actually needs to)
+        rates = self.state.precomputed_rates
         zero_index = len(rates) // 2
 
         # get the full attachment range to the other side (left inclusive, right exclusive)
+        # (plain scalar arithmetic instead of 2-element numpy arrays: this whole
+        # block runs once per rate lookup, and numpy's array-creation/dispatch
+        # overhead swamps the cost of the arithmetic itself at this scale)
         left_index = self.left_neighbor_opposite_index + 1
         right_index = self.right_neighbor_opposite_index
-        attachment_range = np.array([left_index, right_index])
 
         # subtract closest_index to get the attachment_range relative to this prc1's position
         closest_index = self.closest_index_on_other_side
-        relative_attachment_range = attachment_range-closest_index
 
         # make sure left_range, right_range are in bounds to access precomputed_rates
-        left_range, right_range = relative_attachment_range + zero_index
+        left_range = left_index - closest_index + zero_index
+        right_range = right_index - closest_index + zero_index
         if left_range < 0: left_range = 0
         if right_range > len(rates): right_range = len(rates)
-        actual_range = np.array([left_range, right_range]) - zero_index + closest_index
+        actual_range = (left_range - zero_index + closest_index, right_range - zero_index + closest_index)
 
-        # account for cooperativity
-        if self.state.enable_cooperativity is True:
-            # find all taken sites within the range (including one more index to the left and right)
-            if self.top_head_is_attached:
-                taken_indices = self.state.bottom_taken_sites.irange(actual_range[0]-1, actual_range[1]+1, inclusive=(True, False))
-            elif self.bottom_head_is_attached:
-                taken_indices = self.state.top_taken_sites.irange(actual_range[0]-1, actual_range[1]+1, inclusive=(True, False))
-            
-            # set all corresponding rates to 0, and multiply neighboring rates by cooperativity
-            cooperativity_coeff = np.exp(.5 * self.state.cooperativity_energy / self.state.k_B_T)
-            for index in taken_indices:
-                rate_index = index + zero_index - closest_index
-                rates[rate_index] = 0
-                if rate_index-1 >= 0:
-                    rates[rate_index-1] *= cooperativity_coeff
-                if rate_index+1 < len(rates):
-                    rates[rate_index+1] *= cooperativity_coeff
+        if not self.state.enable_cooperativity:
+            # fast path: rates aren't locally modified, so reuse the cumulative
+            # sum the state already precomputed once at construction instead of
+            # re-copying and re-summing an (up to ~num_sites-long) slice here on
+            # every call -- this is the hot path, called for every unattached/
+            # singly-attached PRC1 on every Gillespie step.
+            if right_range == left_range:
+                if total:
+                    return 0
+                return np.empty(0), actual_range
+            cumulative = self.state.precomputed_cumulative_rates
+            baseline = cumulative[left_range - 1] if left_range > 0 else 0.0
+            if total:
+                return cumulative[right_range - 1] - baseline
+            return cumulative[left_range:right_range] - baseline, actual_range
+
+        # account for cooperativity (only reached when enable_cooperativity is True)
+        rates = rates.copy()
+        # find all taken sites within the range (including one more index to the left and right)
+        if self.top_head_is_attached:
+            taken_indices = self.state.bottom_taken_sites.irange(actual_range[0]-1, actual_range[1]+1, inclusive=(True, False))
+        elif self.bottom_head_is_attached:
+            taken_indices = self.state.top_taken_sites.irange(actual_range[0]-1, actual_range[1]+1, inclusive=(True, False))
+
+        # set all corresponding rates to 0, and multiply neighboring rates by cooperativity
+        cooperativity_coeff = np.exp(.5 * self.state.cooperativity_energy / self.state.k_B_T)
+        for index in taken_indices:
+            rate_index = index + zero_index - closest_index
+            rates[rate_index] = 0
+            if rate_index-1 >= 0:
+                rates[rate_index-1] *= cooperativity_coeff
+            if rate_index+1 < len(rates):
+                rates[rate_index+1] *= cooperativity_coeff
 
         cumulative_rates = np.cumsum(rates[left_range:right_range])
 

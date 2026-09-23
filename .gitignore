@@ -23,3 +23,4 @@ gillespie.o
 sequentialwrapper.ipynb
 python_version/__pycache__/
 python_version/.ipynb_checkpoints/
+documentation/

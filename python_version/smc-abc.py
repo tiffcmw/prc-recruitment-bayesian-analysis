@@ -89,7 +89,8 @@ def mixture_logpdf_common_cov(phi: np.ndarray, particles: np.ndarray, weights: n
 
 def simulate_one(theta: np.ndarray, times_obs: np.ndarray, seed: int) -> np.ndarray:
     """
-    theta = [initial_binding_rate, singly_bound_detachment_rate, k0]
+    theta = [initial_binding_rate, singly_bound_detachment_rate,
+             base_double_attachment_rate, base_double_detachment_rate]
     returns y(t)=len(state) sampled on times_obs
     """
     # spatial gillespie uses np.random.* internally -> seed global rng for reproducibility
@@ -98,7 +99,8 @@ def simulate_one(theta: np.ndarray, times_obs: np.ndarray, seed: int) -> np.ndar
     return run_gillespie_prc1_on_grid(
         initial_binding_rate=float(theta[0]),
         singly_bound_detachment_rate=float(theta[1]),
-        k0=float(theta[2]),
+        base_double_attachment_rate=float(theta[2]),
+        base_double_detachment_rate=float(theta[3]),
         times_obs=times_obs,
         # exact SSA (no forced "no-reaction" steps) by default
     )
@@ -126,7 +128,7 @@ def evaluate_candidate_phi(phi: np.ndarray,
 
 @dataclass
 class SMCABCResult:
-    particles_phi: np.ndarray   # (P, 3)
+    particles_phi: np.ndarray   # (P, 4)
     weights: np.ndarray         # (P,)
     eps_history: list[float]
     dist_history: list[np.ndarray]
@@ -175,7 +177,7 @@ def smc_abc_prc1(times_obs: np.ndarray,
                 n_jobs: int = -1,
                 batch_factor: int = 8) -> SMCABCResult:
     """
-    Parallel SMC-ABC for the 3-parameter spatial PRC1 model.
+    Parallel SMC-ABC for the 4-parameter spatial PRC1 model.
 
     Parallelism:
     - Pilot: evaluates all `pool` prior samples in parallel.
