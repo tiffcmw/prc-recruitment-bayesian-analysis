@@ -2,7 +2,6 @@
 #include "prc1System.h"
 
 
-std::vector<double> PRC1System::sites = {};
 PRC1System::PRC1System(double microtubule_length, double site_spacing, double offset,  double spring_constant, double rest_length, double k_B_T, double microtubule_seperation) {
     microtubule_offset = offset;
     num_agents = 0;
