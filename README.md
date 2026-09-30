@@ -27,7 +27,7 @@ Read [python implementation details](./documentation/python_version_implementati
 
 Pass `steric_range_nm` to `run_gillespie_prc1` or `run_gillespie_prc1_on_grid` to make an occupied site reduce the single-head binding probability of nearby free sites on the same microtubule. The default `steric_range_nm=0` switches it off and reproduces the previous model exactly. The range is in nm and converted to sites in one place (`range_nm_to_sites`); a range smaller than one site warns and disables the feature.
 
-- `steric_mode="graded"` (default): each occupied neighbor at distance d multiplies the weight by `1 - (1 - steric_contact_factor) * exp(-d / steric_decay_nm)`. `steric_decay_nm` defaults to `steric_range_nm / 3`, and `steric_contact_factor` defaults to 0.
+- `steric_mode="graded"` (default): each occupied neighbor at distance d multiplies the weight by `1 - (1 - steric_contact_factor) * exp(-d / steric_decay_nm)`. `steric_decay_nm` defaults to `steric_range_nm / 3`, and `steric_contact_factor` defaults to 0 and is the limit as d approaches 0 (the nearest reachable site is one site spacing away, so its weight is larger).
 - `steric_mode="hard"`: sites within the range of an occupied site cannot be bound.
 
 The distance law is a working hypothesis, not a literature result. It currently applies to single-head binding only, and cannot be combined with cooperativity or hopping (pass `enable_hopping=False`; `run_gillespie_prc1_on_grid` defaults to hopping on). See ISSUES.md, issue 3.

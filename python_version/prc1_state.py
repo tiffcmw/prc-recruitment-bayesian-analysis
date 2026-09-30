@@ -19,8 +19,8 @@ def range_nm_to_sites(range_nm, site_spacing):
     A positive range smaller than one site is NOT rounded up to a one-site effect: it warns and
     returns 0 (feature off), so the caller knows the lattice cannot resolve that range.
     """
-    if range_nm < 0:
-        raise ValueError(f"steric range must be non-negative, got {range_nm} nm")
+    if not math.isfinite(range_nm) or range_nm < 0:
+        raise ValueError(f"steric range must be a finite, non-negative number, got {range_nm} nm")
     if range_nm == 0:
         return 0
     sites = int(math.floor(range_nm / site_spacing + 1e-9))
@@ -51,6 +51,7 @@ class StericField:
         self.blocked = [0] * num_sites     # number of hard blockers within range
         self.neighbors = [0] * num_sites   # number of occupied sites within range
         self.taken = [False] * num_sites
+        self.occupied = 0
         self.total = float(num_sites)
         self._updates = 0
 
@@ -77,6 +78,7 @@ class StericField:
             if not self.taken[i]:
                 total += 0.0 if blocked[i] else weight[i]
         self.total = total
+        self.occupied += 1
         self._after_update()
 
     def release(self, site):
@@ -99,9 +101,16 @@ class StericField:
             if not self.taken[i]:
                 total += 0.0 if blocked[i] else weight[i]
         self.total = total + self.site_weight(site)
+        self.occupied -= 1
         self._after_update()
 
     def _after_update(self):
+        # an empty lane has every weight exactly 1 and a full lane has no free site: snap to those
+        # exact values so accumulated rounding error cannot leave a tiny positive rate on a full lane
+        if self.occupied == 0:
+            self.total = float(self.num_sites)
+        elif self.occupied == self.num_sites:
+            self.total = 0.0
         self._updates += 1
         if self._updates >= self.RESYNC_EVERY:
             self._updates = 0
@@ -125,6 +134,17 @@ class SortedSetAndComplement(SortedSet):
         self.single_adjacencies = SortedSet()
         self.double_adjacencies = SortedSet()
         self.steric = steric
+
+    def __deepcopy__(self, memo):
+        # SortedSet.__reduce__ would rebuild this as cls(set, key), which this constructor would
+        # misread (the taken set as the universe), so rebuild members, complement, adjacencies
+        # and the steric field explicitly.
+        clone = SortedSetAndComplement(list(self.complement) + list(self))
+        memo[id(self)] = clone
+        for value in self:
+            clone.add(value)
+        clone.steric = deepcopy(self.steric, memo)
+        return clone
 
     def add(self, value):
         # self.current_set.add(value)
@@ -198,7 +218,9 @@ class State:
         Steric blocking of single-head binding (off by default, steric_range_nm=0):
         a free site's binding weight is the product, over occupied sites j on the same lane within
         steric_range_nm, of f(d) with d the distance in nm. "graded": f(d) = 1 - (1 - contact_factor)
-        * exp(-d / decay), decay defaulting to steric_range_nm / 3. "hard": f(d) = 0 inside the range.
+        * exp(-d / decay), decay defaulting to steric_range_nm / 3. contact_factor is the limit as
+        d -> 0; the nearest reachable site is one site spacing away, so its weight is larger.
+        "hard": f(d) = 0 inside the range.
         The range is converted to sites by range_nm_to_sites and exposed as steric_range_sites.
         Currently not combinable with cooperativity (see ISSUES.md).
         """
@@ -252,8 +274,8 @@ class State:
                              "set enable_cooperativity=False or steric_range_nm=0")
 
         # keep track of taken (and untaken) sites for fast lookup
-        self.top_taken_sites = self.__new_taken_sites()
-        self.bottom_taken_sites = self.__new_taken_sites()
+        self.top_taken_sites = self._new_taken_sites()
+        self.bottom_taken_sites = self._new_taken_sites()
 
         # self.prc1_set = SortedSet()
         self.doubly_attached_prc1 = SortedSet()
@@ -296,7 +318,7 @@ class State:
     def steric_active(self):
         return self.steric_range_sites > 0
 
-    def __new_taken_sites(self):
+    def _new_taken_sites(self):
         """an empty per-lane taken-site set, with a StericField attached when steric blocking is on"""
         steric = None
         if self.steric_active:
@@ -309,18 +331,18 @@ class State:
             steric = StericField(self.num_sites, self.steric_range_sites, factors)
         return SortedSetAndComplement(range(self.num_sites), steric)
 
-    def __steric_field(self, lane):
+    def _steric_field(self, lane):
         if not self.steric_active:
             raise RuntimeError("steric blocking is off (steric_range_nm resolves to 0 sites)")
         return (self.bottom_taken_sites if lane == "bottom" else self.top_taken_sites).steric
 
     def steric_weight(self, lane, site):
         """binding weight in [0, 1] of `site` on `lane` ("bottom" or "top"); 0 if taken or hard-blocked"""
-        return self.__steric_field(lane).site_weight(site)
+        return self._steric_field(lane).site_weight(site)
 
     def steric_total(self, lane):
         """sum of steric weights over the free sites of `lane`"""
-        return self.__steric_field(lane).total
+        return self._steric_field(lane).total
 
     def sample_binding_site(self, lane):
         """
@@ -328,11 +350,11 @@ class State:
         (weights are at most 1, so accepting with probability weight is exact). The two RNG draws use
         np.random so that np.random.seed keeps the whole simulation reproducible.
         """
-        field = self.__steric_field(lane)
-        if field.total <= 0:
-            raise RuntimeError(f"no {lane} site is available under steric blocking")
+        field = self._steric_field(lane)
         untaken = (self.bottom_taken_sites if lane == "bottom" else self.top_taken_sites).complement
         num_untaken = len(untaken)
+        if field.total <= 0 or num_untaken == 0:
+            raise RuntimeError(f"no {lane} site is available under steric blocking")
         while True:
             site = untaken[int(np.random.random() * num_untaken)]
             if np.random.random() < field.site_weight(site):
@@ -391,8 +413,8 @@ class State:
     # BASIC OPERATIONS
 
     def clear(self):
-        self.top_taken_sites = self.__new_taken_sites()
-        self.bottom_taken_sites = self.__new_taken_sites()
+        self.top_taken_sites = self._new_taken_sites()
+        self.bottom_taken_sites = self._new_taken_sites()
         self.top_attached_prc1.clear()
         self.bottom_attached_prc1.clear()
         self.doubly_attached_prc1.clear()
@@ -603,7 +625,13 @@ class State:
             # update singly attached neighbors
             self.set_neighbors_between_prc1(left_neighbor, right_neighbor)
 
+    def _reject_steric_hopping(self):
+        if self.steric_active:
+            raise NotImplementedError("hopping is not steric aware yet: it could move a head inside "
+                                      "another head's steric range (see ISSUES.md, issue 3)")
+
     def hop_top(self, prc1_index):
+        self._reject_steric_hopping()
         prc1 = self.get_prc1(prc1_index)
         if not prc1.top_head_is_attached:
             raise RuntimeError("warning: tried to hop top head of prc1 with unattached top head")
@@ -617,6 +645,7 @@ class State:
         prc1.binding_site_top = new_site
     
     def hop_bottom(self, prc1_index):
+        self._reject_steric_hopping()
         prc1 = self.get_prc1(prc1_index)
         if not prc1.bottom_head_is_attached:
             raise RuntimeError("warning: tried to hop bottom head of prc1 with unattached bottom head")
@@ -631,6 +660,7 @@ class State:
 
     # detaches and reattaches all prc1 heads in random order, to simulate hopping
     def fast_hop(self):
+        self._reject_steric_hopping()
         # ordering: top double, top single, bottom single, bottom double
         num_heads = len(self) + len(self.doubly_attached_prc1)
         order = np.random.permutation(num_heads)
