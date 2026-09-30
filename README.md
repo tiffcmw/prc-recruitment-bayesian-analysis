@@ -32,7 +32,7 @@ Pass `steric_range_nm` to `run_gillespie_prc1` or `run_gillespie_prc1_on_grid` t
 
 To sweep the range and plot the results, run `python python_version/steric_sweep.py run` (saves one `.npz` per setting under `results/steric_sweep/`, gitignored) and `python python_version/steric_sweep.py plot` (redraws figures from the saved files without simulating). See `notebooks/steric_blocking_demo.ipynb` for a short walkthrough and `reports/steric_blocking_report.md` for the write-up.
 
-The distance law is a working hypothesis, not a literature result. It currently applies to single-head binding only, and cannot be combined with cooperativity or hopping (pass `enable_hopping=False`; `run_gillespie_prc1_on_grid` defaults to hopping on). See ISSUES.md, issue 3.
+The distance law is a working hypothesis, not a literature result. It currently applies to single-head binding only, and cannot be combined with cooperativity or with `enable_hopping="slow"` or `"fast"`. See ISSUES.md, issue 3. Note that `enable_hopping=True` does not actually hop (ISSUES.md, issue 4).
 
 ## Testing
 

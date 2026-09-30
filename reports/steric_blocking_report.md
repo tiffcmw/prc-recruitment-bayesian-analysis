@@ -1,9 +1,9 @@
 # Steric blocking report
 
-Branch: `feat/steric-blocking` (off `test/tiffany`). Status: implementation, tests, first sweep and demo notebook done. Not merged, not pushed.
+Branch: `feat/steric-blocking` (off `test/tiffany`). Status: implementation, tests, review fixes, first sweep and demo notebook done.
 This file is updated after each step. Generated data and figures are not committed (`results/steric_sweep/` is gitignored).
 
-Files: `python_version/steric_sweep.py` (run, load, plot), `notebooks/steric_blocking_demo.ipynb`, `python_version/tests/test_steric.py`, `test_steric_sweep.py`, `test_lattice_pin.py`, `ISSUES.md`.
+Files: `python_version/steric_sweep.py` (run, load, plot), `notebooks/steric_blocking_demo.ipynb`, `python_version/tests/test_steric.py`, `test_steric_sweep.py`, `test_lattice_pin.py`, `ISSUES.md`, `reports/second_head_hopping_design_note.md` (proposal only).
 
 ## 1. Unit trace
 
@@ -43,7 +43,7 @@ Literature support (verified from the local PDFs): nearest-neighbor Boltzmann fa
 
 ## 3. Test results
 
-Full suite on the branch: 140 passed (`python -m pytest`; 124 for the feature itself plus 16 for the sweep tooling), including:
+Full suite on the branch: 163 passed (`python -m pytest`): 66 steric feature tests, 33 sweep tooling tests, 1 lattice pin, 6 baseline-bug tests and the 57 original tests. The steric tests include:
 
 - limiting case: range 0 nm reproduces pre-feature trajectories exactly (two golden runs);
 - monotonicity: weight increases with distance from an occupied site, symmetric left and right, zero effect beyond the range;
@@ -54,85 +54,88 @@ Full suite on the branch: 140 passed (`python -m pytest`; 124 for the feature it
 
 An independent `python-reviewer` pass found one HIGH defect (deepcopy silently corrupting the taken sets, introduced by this work). It was reproduced, covered by a failing test first, and fixed.
 
-Sweep tooling tests (16): the sweep's own driver reproduces `run_gillespie_prc1` exactly on the production lattice (guards against drift), saved files have the documented fields and reload, hard exclusion leaves no first head inside the footprint, error bands use the spread across seeds, and figures regenerate from saved files with the simulation functions disabled.
+Fresh-context review (a second `python-reviewer` pass with no prior context, no C++ was touched so no `cpp-reviewer`): no defects in the steric bookkeeping or in the default path. Its findings were in the sweep tooling and one guard, and each was fixed with a regression test written to fail first (22 new failing tests, now passing): pair density was normalized to the whole lane although heads live in the overlap; the attachment fraction depended on density; a single seed reported a standard error of 0; stale files from an earlier sweep were mixed in; truncated runs were not flagged; sub-site ranges ran as mislabeled steric-off; the hopping guard rejected `enable_hopping=True`, which does not hop; and the rejection sampler had no iteration cap.
+
+Zero-range equivalence, checked on the final code: 30 seeds run on the pre-feature code (`test/tiffany`, in a scratch worktree) and on this branch, with `steric_range_nm` omitted and with `steric_range_nm=0.0`. All 30 full trajectories (every step count and event time, compared by SHA-256) are bit-identical in all three cases. The saved 0 nm sweep runs (sweep driver plus measurement hooks) also match the pre-feature baseline on final PRC1 count and step count for every seed. The regression tests `test_zero_range_reproduces_pre_feature_trajectories_exactly` (golden runs) and the sweep-driver equivalence test guard this on every run of the suite.
 
 Earlier baseline fixes (merged into `test/tiffany` before this work, each with a failing test first): free-site count double counted (single-attach rate about 2x), swapped head weights in double detach, and adjacent sites counted twice in the binding rate when cooperativity is off. Any earlier fit made before these fixes will not reproduce.
 
 ## 4. Sweep results
 
+This section replaces the first version of the sweep, which used a whole-lane pair normalization and a density-dependent attachment measure (both found in review). The dynamics are unchanged: same seeds, same final counts.
+
 ### Setup
 
 - Production lattice (5000 nm, 0.2 nm sites), no hopping, no cooperativity, contact factor 0, decay R / 3.
-- Ranges 0 (off), 2, 4, 8, 16, 32 nm, each in graded and hard mode. 30 seeds (0 to 29), the same seeds for every setting.
-- Binding rate per site 2e-4, run to 30 time units (no run hit the step cap; at most 2263 steps). This density gives about 180 PRC1 with steric off, against about 30 at the 4e-5 used in the tests. It is a density choice so there are enough heads to measure, not a fitted value. The runs are not at steady state.
-- Total time 206 s. Data: `results/steric_sweep/range_*.npz` (one per setting: seed, range, mode, pair-occupancy counts, first-head attachment distances, binding-rate profile, runtime), `summary.csv`, `manifest.json` (config and git commit). Reproduce with `python python_version/steric_sweep.py run`, redraw with `python python_version/steric_sweep.py plot`.
+- Ranges 0 (off), 2, 4, 8, 16, 32 nm, each in graded and hard mode. 30 seeds (0 to 29), the same seed list for every setting (not common random numbers: the steric and default samplers draw different random numbers, so runs are effectively independent).
+- Binding rate per site 2e-4, run to 30 time units. No run was truncated. This density gives about 180 PRC1 with steric off, against about 30 at the 4e-5 used in the tests. It is a density choice so there are enough heads to measure. It is not a fitted value, and any rate called "fitted" is only valid on this 0.2 nm lattice (25001 sites per lane).
+- Total simulation time 209 s over 330 runs. Data: `results/steric_sweep/range_*.npz` (one per setting: seeds, range, mode, pair counts and expectations, first-head attachment distances and their uniform-binding expectation, binding-rate profile, runtime), `summary.csv`, `manifest.json` (config and git commit). Reproduce with `python python_version/steric_sweep.py run`, redraw with `python python_version/steric_sweep.py plot`.
+
+### Two measures that control for density
+
+- **Pair density g(d)** is the number of same-lane head pairs at distance d divided by the number expected if the heads were uniform inside the overlap of the two microtubules, where 98.8% of heads sit. g = 1 means no correlation.
+- **Observed / expected first-head attachments** compares, for each new first head, its distance to the nearest bound head with what a uniformly chosen free site would give at that moment (exact, from the gaps between heads). 1 means no steric effect and 0 means none land that close, whatever the density. **The steric-off runs give 1.02 +- 0.05, 1.01 +- 0.03, 0.99 +- 0.02 and 0.99 +- 0.01 at 2, 4, 8 and 16 nm, which validates the null.**
 
 ### Results (mean +- standard error over 30 seeds)
 
-| Range (nm) | Mode | PRC1 bound at end | New first heads within 8 nm of a bound head | Within 16 nm | Pair density g(d), 0 to 4 nm |
+| Range (nm) | Mode | PRC1 bound at end | New first heads within 8 nm of a bound head | Observed / expected within 8 nm | Pair density g, 0 to 4 nm |
 |---|---|---|---|---|---|
-| 0 | off | 180.2 +- 2.5 | 0.218 +- 0.005 | 0.340 +- 0.006 | 1.47 +- 0.04 |
-| 2 | graded | 178.6 +- 2.1 | 0.205 +- 0.003 | 0.333 +- 0.004 | 1.41 +- 0.03 |
-| 2 | hard | 164.3 +- 2.3 | 0.164 +- 0.004 | 0.300 +- 0.006 | 1.16 +- 0.03 |
-| 4 | graded | 173.4 +- 2.3 | 0.193 +- 0.004 | 0.322 +- 0.005 | 1.30 +- 0.03 |
-| 4 | hard | 148.2 +- 1.9 | 0.107 +- 0.004 | 0.253 +- 0.005 | 0.84 +- 0.03 |
-| 8 | graded | 160.9 +- 2.1 | 0.154 +- 0.004 | 0.289 +- 0.005 | 1.19 +- 0.03 |
-| 8 | hard | 123.7 +- 1.2 | 0.000 | 0.164 +- 0.004 | 0.67 +- 0.02 |
-| 16 | graded | 142.4 +- 1.2 | 0.103 +- 0.003 | 0.234 +- 0.003 | 0.91 +- 0.02 |
-| 16 | hard | 92.7 +- 1.0 | 0.000 | 0.000 | 0.39 +- 0.03 |
-| 32 | graded | 117.9 +- 1.1 | 0.058 +- 0.002 | 0.157 +- 0.004 | 0.72 +- 0.03 |
-| 32 | hard | 59.9 +- 0.5 | 0.000 | 0.000 | 0.08 +- 0.02 |
+| 0 | off | 180.2 +- 2.5 | 0.219 +- 0.005 | 0.99 +- 0.02 | 0.89 +- 0.02 |
+| 2 | graded | 178.6 +- 2.1 | 0.206 +- 0.003 | 0.93 +- 0.01 | 0.86 +- 0.02 |
+| 2 | hard | 164.3 +- 2.3 | 0.164 +- 0.004 | 0.77 +- 0.02 | 0.71 +- 0.02 |
+| 4 | graded | 173.4 +- 2.3 | 0.194 +- 0.004 | 0.88 +- 0.02 | 0.80 +- 0.02 |
+| 4 | hard | 148.2 +- 1.9 | 0.107 +- 0.004 | 0.52 +- 0.02 | 0.51 +- 0.02 |
+| 8 | graded | 160.9 +- 2.1 | 0.155 +- 0.004 | 0.73 +- 0.01 | 0.72 +- 0.02 |
+| 8 | hard | 123.7 +- 1.2 | 0.000 | 0.00 | 0.41 +- 0.01 |
+| 16 | graded | 142.4 +- 1.2 | 0.103 +- 0.003 | 0.52 +- 0.02 | 0.56 +- 0.01 |
+| 16 | hard | 92.7 +- 1.0 | 0.000 | 0.00 | 0.24 +- 0.02 |
+| 32 | graded | 117.9 +- 1.1 | 0.058 +- 0.002 | 0.32 +- 0.01 | 0.44 +- 0.02 |
+| 32 | hard | 59.9 +- 0.5 | 0.000 | 0.00 | 0.05 +- 0.01 |
+
+The fraction of new first heads is taken among attachments onto a lane that already had a bound head. Observed / expected within 2 nm (graded) is 0.73, 0.56, 0.35, 0.18 and 0.09 for 2, 4, 8, 16 and 32 nm.
 
 ### What the data show
 
-- The measured first-head attachment profile follows the model: fewer new heads land close to a bound head, more so for longer ranges and for hard exclusion. With hard exclusion no first head lands inside the range (exact zeros in the table).
-- Occupancy near a head falls with range, but for hard exclusion it does not reach zero (g = 0.67 at 8 nm, against 1.47 with steric off), because second heads ignore the penalty and still land inside the footprint. This is the first-head-only limitation showing up in the data.
-- Beyond the range nothing changes: g(d) at 40 to 64 nm is 1.60 to 1.66 in every setting.
-- g(d) is above 1 even with steric off (1.47 at 0 to 4 nm, about 1.6 far away). This is not clustering; it is confinement. Heads sit almost entirely inside the 3000 nm overlap of the two microtubules, which is 60% of each 5000 nm lane, and g is normalized to the whole lane, so uniform placement inside the overlap gives 1 / 0.6 = 1.67. See "Why g(d) is about 1.5 with steric off" below. Read effects against the off curve, not against 1.
-- The number of bound PRC1 falls with range. At one dimer (8 nm): 161 for graded (about 11% fewer than off) and 124 for hard (about 31% fewer). A graded 2 nm range is not distinguishable from off (178.6 +- 2.1 against 180.2 +- 2.5). At 32 nm the count is 118 (graded) and 60 (hard).
-- Runtime per run falls with range (table below). The reason is partly the number of heads and partly the sampler, see below.
+- For the graded law, first heads land near bound heads less often than uniform binding would give, and the reduction grows with range and is strongest close to the head (0.35 of uniform within 2 nm for an 8 nm range, 0.73 within 8 nm). For hard exclusion no first head lands inside the range (exact zeros).
+- Beyond the range the pair density is unchanged: g in the 40 to 64 nm bins is 0.99 to 1.05 in every setting.
+- Occupancy near a head drops with range but not to zero for hard exclusion: with hard 8 nm, g at 0 to 4 nm is 0.41, not 0, because second heads ignore the penalty and still land inside the footprint. This is the first-head-only limitation showing up in the data.
+- With steric off, g is 0.89 at 0 to 4 nm, 0.94 at 4 to 8 nm and 1.01 at 8 to 12 nm. That small short-range deficit is not caused by steric blocking; its cause is not established (open question 6).
+- The number of bound PRC1 falls with range. At 8 nm (40 sites on this lattice; one dimer only if the 8 nm spacing holds): 161 for graded (about 11% fewer than off) and 124 for hard (about 31% fewer). A graded 2 nm range is not distinguishable from off (178.6 +- 2.1 against 180.2 +- 2.5). At 32 nm: 118 (graded) and 60 (hard).
 
-### Why g(d) is about 1.5 with steric off
+### Why the earlier whole-lane g(d) was about 1.5 with steric off
 
-Cooperativity is off in this sweep, so it cannot be the cause. What I measured (12 seeds, steric off, same settings as the sweep):
+Cooperativity is off in this sweep, so it cannot be the cause. What I measured (12 seeds, steric off, same settings):
 
 - 99.2% of the 4227 bound heads lie inside the overlap window (bottom lane sites 10000 to 25000, top lane sites 0 to 15000), and 98.5% of PRC1 are doubly attached (2098 of 2129). The overlap is 15001 of 25001 sites (60.0%).
-- g is computed against uniform placement over the whole lane, so heads confined to a 60% window give 1 / 0.6 = 1.67 far from any head. The measured far value is about 1.6.
-- Normalizing to the overlap window instead (pairs of heads inside it, expectation uniform inside it) gives g = 0.98 at 4 to 8 nm, 0.99 at 8 to 12 nm and 1.05 at 12 to 20 nm. That is uniform within the overlap, so there is no crosslinker-mediated clustering at these distances.
-- Unresolved: within the window g is 0.89 in the 0 to 4 nm bin, an 11% deficit. I did not establish its cause. Candidates are the geometry of doubly attached neighbors (heads of adjacent doubly attached PRC1 cannot cross, and second heads are placed relative to the first) and the same-site exclusion; neither was tested.
-
-Consequence for the figures: the pair-density panels use a whole-lane normalization, so the off curve sits near 1.6 for a geometric reason. The differences between settings are unaffected. A window normalization (or a saved head-position histogram) would be cleaner and is proposed for the next sweep.
+- g normalized to the whole lane gives 1 / 0.6 = 1.67 for heads uniform inside a 60% window. The measured far value was about 1.6. This is confinement, not crosslinker-mediated clustering.
+- Normalized to the overlap window, g is 0.98 to 1.05 from 4 nm outward. The sweep now uses this normalization, and its steric-off g is 0.99 far from any head.
+- Unresolved: g is 0.89 in the 0 to 4 nm bin with steric off. Candidates are the geometry of doubly attached neighbors (heads of adjacent doubly attached PRC1 cannot cross, and second heads are placed relative to the first) and the same-site exclusion; neither was tested.
 
 ### Runtime per setting
 
-Wall time of one run (30 seeds each, mean +- standard error), steps per run, and time per step. The whole sweep was 330 runs and 205 s.
+Wall time of one run (30 seeds each, mean +- standard error), steps per run, and time per step. The whole sweep was 330 runs and 209 s. Times include the sweep's measurement hooks (pair snapshots and the uniform-binding expectation), which cost about 8% per step with steric off and about 5% for graded 8 nm (plain runs: 0.498, 0.393 and 0.339 ms per step for off, graded 8 nm and hard 8 nm).
 
 | Range (nm) | Mode | Run time (s) | Steps per run | Time per step (ms) | Run time vs off |
 |---|---|---|---|---|---|
-| 0 | off | 0.99 +- 0.02 | 1891 +- 27 | 0.522 +- 0.006 | 1.00x |
-| 2 | graded | 0.80 +- 0.02 | 1863 +- 23 | 0.426 +- 0.006 | 0.80x |
-| 2 | hard | 0.72 +- 0.02 | 1780 +- 27 | 0.400 +- 0.005 | 0.72x |
-| 4 | graded | 0.78 +- 0.02 | 1848 +- 25 | 0.422 +- 0.006 | 0.79x |
-| 4 | hard | 0.62 +- 0.01 | 1654 +- 19 | 0.371 +- 0.005 | 0.62x |
-| 8 | graded | 0.71 +- 0.02 | 1751 +- 23 | 0.403 +- 0.005 | 0.71x |
-| 8 | hard | 0.51 +- 0.01 | 1478 +- 14 | 0.344 +- 0.007 | 0.51x |
-| 16 | graded | 0.64 +- 0.01 | 1606 +- 16 | 0.396 +- 0.005 | 0.64x |
-| 16 | hard | 0.36 +- 0.01 | 1228 +- 12 | 0.292 +- 0.004 | 0.36x |
-| 32 | graded | 0.52 +- 0.01 | 1437 +- 16 | 0.360 +- 0.004 | 0.52x |
-| 32 | hard | 0.21 +- 0.00 | 946 +- 7 | 0.222 +- 0.001 | 0.21x |
+| 0 | off | 1.02 +- 0.03 | 1891 +- 27 | 0.537 +- 0.007 | 1.00x |
+| 2 | graded | 0.83 +- 0.02 | 1863 +- 23 | 0.442 +- 0.006 | 0.81x |
+| 2 | hard | 0.75 +- 0.02 | 1780 +- 27 | 0.417 +- 0.006 | 0.73x |
+| 4 | graded | 0.81 +- 0.02 | 1848 +- 25 | 0.436 +- 0.006 | 0.79x |
+| 4 | hard | 0.63 +- 0.01 | 1654 +- 19 | 0.379 +- 0.004 | 0.62x |
+| 8 | graded | 0.73 +- 0.02 | 1751 +- 23 | 0.414 +- 0.005 | 0.71x |
+| 8 | hard | 0.50 +- 0.01 | 1478 +- 14 | 0.338 +- 0.003 | 0.49x |
+| 16 | graded | 0.63 +- 0.01 | 1606 +- 16 | 0.391 +- 0.003 | 0.62x |
+| 16 | hard | 0.35 +- 0.01 | 1228 +- 12 | 0.285 +- 0.003 | 0.34x |
+| 32 | graded | 0.52 +- 0.01 | 1437 +- 16 | 0.362 +- 0.004 | 0.51x |
+| 32 | hard | 0.22 +- 0.00 | 946 +- 7 | 0.230 +- 0.001 | 0.21x |
 
-Steric runs are faster, not slower, and the reason is two effects that I did not separate cleanly:
-
-- Fewer bound PRC1 means fewer terms in the rate list and fewer steps.
-- The steric path draws a site by rejection from the sorted free-site set (O(log n)), while the default path calls `np.random.choice` on the whole free-site set (O(N)). Even the 2 nm graded runs, which end with almost the same number of PRC1 as off (178.6 against 180.2), take 0.426 ms per step against 0.522 ms. This is a pre-existing inefficiency in the default path. It is left alone, because changing that sampler would change the random stream and break exact reproduction of the earlier model.
-
-The update cost of the penalty itself is small: about 13 us for a 40-site (8 nm) update, measured in isolation on the production lattice.
+Steric runs are faster, not slower, and two effects are mixed together: fewer bound PRC1 means fewer terms in the rate list and fewer steps, and the steric path draws a site by rejection from the sorted free-site set (O(log n)) while the default path calls `np.random.choice` on the whole free-site set (O(N)). Even the 2 nm graded runs, which end with almost the same number of PRC1 as off (178.6 against 180.2), take 0.442 ms per step against 0.537 ms. That is a pre-existing inefficiency in the default path. It is left alone, because changing that sampler would change the random stream and break exact reproduction of the earlier model. The update cost of the penalty itself is small: about 13 us for a 40-site (8 nm) update, measured in isolation on the production lattice.
 
 ### Caveats
 
-- One binding rate, one end time, 30 seeds. The size of the effect depends on density and on time, so these numbers are a sensitivity picture, not a prediction.
-- The 8 nm row is "one dimer" only if the units check holds; on this lattice it is 40 sites.
-- Standard errors are across seeds and do not account for the pairing by seed.
+- Steady state is not reached. At 2e-4 with steric off the PRC1 count is still rising at t = 240 (for seed 0: 343 at t = 60, 627 at t = 120, 871 at t = 180, 1008 at t = 240, 3 seeds all similar, about 190 s per run). With hard 8 nm the count flattens much sooner (262 at t = 120, 304 at t = 180, 316 at t = 240). The t = 30 comparison is a fixed-time sensitivity picture, and range is confounded with how far each setting has progressed.
+- One binding rate and one end time; only the range was varied. Decay length and contact factor were fixed.
+- Standard errors are across seeds and treat the settings as independent samples.
 - Figures (not committed): `results/steric_sweep/figures/` (`binding_profile`, `pair_profile`, `attach_profile`, `summary`). Palette: blue sequential ramp for range (validated with the dataviz `--ordinal` check), line style for mode, gray for off.
 
 ## 5. Limitations
@@ -152,3 +155,4 @@ The update cost of the penalty itself is small: about 13 us for a 40-site (8 nm)
 4. Should second-head binding and hopping become steric aware next? The pair-density data show the second-head gap directly.
 5. Should the next sweep vary the decay length and contact factor, and run to a steady state or at a fitted binding rate, so the range is not confounded with density and time?
 6. What causes the 11% deficit in same-lane pair density at 0 to 4 nm with steric off (0.89 of uniform within the overlap)? Not established; see "Why g(d) is about 1.5 with steric off".
+7. `enable_hopping=True` does not hop, and `smc-abc.py` uses it by default (`ISSUES.md` issue 4). Was hopping intended in the inference runs? If so, every earlier fit assumed no hopping.

@@ -62,6 +62,22 @@ Status: by design for the first version.
 Steric blocking (`steric_range_nm`, default 0 nm, off) currently applies to single-head binding only:
 
 - Not combinable with cooperativity. `State` raises `ValueError`, because the cooperative adjacency categories would need per-category steric sums. Depends on the outcome of issue 1.
-- Not combinable with hopping. `run_gillespie_prc1` raises `ValueError`, because hopping can move a head inside another head's range and would need a matching factor to stay consistent with detailed balance. Note that `run_gillespie_prc1_on_grid` defaults to `enable_hopping=True`, so pass `enable_hopping=False` explicitly.
+- Not combinable with hopping. `run_gillespie_prc1` raises `ValueError` for `enable_hopping="slow"` or `"fast"`, because hopping can move a head inside another head's range and would need a matching factor to stay consistent with detailed balance. `enable_hopping=True` is allowed because it does not hop at all (issue 4). `State.hop_top`, `hop_bottom` and `fast_hop` also raise `NotImplementedError` when steric blocking is on.
 - Second-head binding (the double-attach cumulative-sum fast path) does not see the penalty, so a second head can still land inside the range of a head on the other lane.
 - The distance law is a working hypothesis, not a literature result. No verified source in `papers/` gives a graded distance dependence for PRC1 on microtubules.
+
+## 4. `enable_hopping=True` does not enable hopping, and the inference code uses it
+
+Status: open, reported, not changed. Found during the fresh-context review of the steric branch.
+
+### What it does today
+
+- `run_gillespie_prc1` only reads `enable_hopping == "slow"` (`run_gillespie.py:52`, `:77`) and `enable_hopping == "fast"` (`:95`). `True` matches neither, so no hopping happens. Verified: with the same seed, `enable_hopping=True` and `False` give identical trajectories, while `"fast"` differs. `tests/test_steric.py::test_enable_hopping_true_never_hops_so_it_is_identical_to_false` pins this.
+- The README says "If you want to enable hopping pass in `enable_hopping=True`", and `run_gillespie_prc1_on_grid` defaults to `enable_hopping=True` (`run_gillespie.py:106`).
+- `smc-abc.py` calls `run_gillespie_prc1_on_grid` without `enable_hopping` (`smc-abc.py:99-105`), so it gets the default `True`. SMC-ABC runs made with this code therefore used no hopping.
+
+### What it would change
+
+- If hopping is intended, the default and the README should say `"fast"` (or `"slow"`), and SMC-ABC would need to pass it. Results would change, since hopping changes the trajectories; any earlier fit assumed no hopping.
+- If no hopping is intended, the parameter and README should say so, and `True` should be removed or rejected.
+- I have not decided which, because the intended model is not stated anywhere I found.
