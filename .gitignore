@@ -26,3 +26,8 @@ python_version/.ipynb_checkpoints/
 documentation/
 # generated sweep data and figures
 results/steric_sweep/
+# python caches
+__pycache__/
+*.pyc
+# papers are kept locally, not committed (PDFs already tracked before this rule stay tracked)
+papers/

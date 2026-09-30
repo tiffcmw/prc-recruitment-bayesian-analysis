@@ -1,0 +1,11 @@
+# Development tooling for notebooks/ (not needed to run the simulation or the tests).
+-r requirements.txt
+
+# Execute and check notebooks from the command line.
+nbformat
+nbclient
+# nbclient needs a kernel to run cells.
+ipykernel
+
+# Strip notebook outputs before committing: run `nbstripout notebooks/<name>.ipynb`.
+nbstripout

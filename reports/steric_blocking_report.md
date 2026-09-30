@@ -17,7 +17,16 @@ Files: `python_version/steric_sweep.py` (run, load, plot), `notebooks/steric_blo
 
 Not changed in this work. The lattice is pinned by `python_version/tests/test_lattice_pin.py`. Details and what depends on the spacing are in `ISSUES.md`, issue 2.
 
-Existing exclusion at 0.2 nm: same-site only (checked directly: heads at sites 100 and 101 are accepted). A PRC1 therefore has an effective 0.2 nm footprint today.
+### How the existing model keeps two PRC1 apart at 0.2 nm (answer to the earlier question)
+
+It does not, beyond the same site:
+
+- Each lane keeps a set of taken sites (`SortedSetAndComplement`). Single attachment samples only from the untaken sites, so two heads can never share a site. That is the only exclusion.
+- Two heads on the same lane at sites 100 and 101 (0.2 nm apart) are accepted. I checked this directly: the `Prc1` site setters do not look at neighbors, and site 101 stays available to the sampler while 100 is taken.
+- Doubly attached PRC1 additionally cannot cross each other (they are kept in a sorted order). That constrains order, not spacing.
+- A PRC1 therefore has an effective 0.2 nm footprint today, and cooperativity "adjacent" means 0.2 nm apart.
+
+How the new penalty composes with this: it adds to the same-site exclusion (which stays as it is) and does not replace it. It is separate from cooperativity and only acts when a range is set. It is not yet combined with cooperativity (see the design note on second-head binding and hopping).
 
 ## 2. Design decision
 
@@ -79,9 +88,45 @@ Earlier baseline fixes (merged into `test/tiffany` before this work, each with a
 - The measured first-head attachment profile follows the model: fewer new heads land close to a bound head, more so for longer ranges and for hard exclusion. With hard exclusion no first head lands inside the range (exact zeros in the table).
 - Occupancy near a head falls with range, but for hard exclusion it does not reach zero (g = 0.67 at 8 nm, against 1.47 with steric off), because second heads ignore the penalty and still land inside the footprint. This is the first-head-only limitation showing up in the data.
 - Beyond the range nothing changes: g(d) at 40 to 64 nm is 1.60 to 1.66 in every setting.
-- g(d) is above 1 even with steric off (1.47 at 0 to 4 nm, about 1.6 far away), so heads are not spread uniformly along the lane and double attachment clusters them. Effects should be read against the off curve, not against 1.
+- g(d) is above 1 even with steric off (1.47 at 0 to 4 nm, about 1.6 far away). This is not clustering; it is confinement. Heads sit almost entirely inside the 3000 nm overlap of the two microtubules, which is 60% of each 5000 nm lane, and g is normalized to the whole lane, so uniform placement inside the overlap gives 1 / 0.6 = 1.67. See "Why g(d) is about 1.5 with steric off" below. Read effects against the off curve, not against 1.
 - The number of bound PRC1 falls with range. At one dimer (8 nm): 161 for graded (about 11% fewer than off) and 124 for hard (about 31% fewer). A graded 2 nm range is not distinguishable from off (178.6 +- 2.1 against 180.2 +- 2.5). At 32 nm the count is 118 (graded) and 60 (hard).
-- Runtime per run falls with range (0.99 s off, 0.21 s hard 32 nm), because fewer PRC1 means fewer terms in the rate list, not because the penalty is cheaper.
+- Runtime per run falls with range (table below). The reason is partly the number of heads and partly the sampler, see below.
+
+### Why g(d) is about 1.5 with steric off
+
+Cooperativity is off in this sweep, so it cannot be the cause. What I measured (12 seeds, steric off, same settings as the sweep):
+
+- 99.2% of the 4227 bound heads lie inside the overlap window (bottom lane sites 10000 to 25000, top lane sites 0 to 15000), and 98.5% of PRC1 are doubly attached (2098 of 2129). The overlap is 15001 of 25001 sites (60.0%).
+- g is computed against uniform placement over the whole lane, so heads confined to a 60% window give 1 / 0.6 = 1.67 far from any head. The measured far value is about 1.6.
+- Normalizing to the overlap window instead (pairs of heads inside it, expectation uniform inside it) gives g = 0.98 at 4 to 8 nm, 0.99 at 8 to 12 nm and 1.05 at 12 to 20 nm. That is uniform within the overlap, so there is no crosslinker-mediated clustering at these distances.
+- Unresolved: within the window g is 0.89 in the 0 to 4 nm bin, an 11% deficit. I did not establish its cause. Candidates are the geometry of doubly attached neighbors (heads of adjacent doubly attached PRC1 cannot cross, and second heads are placed relative to the first) and the same-site exclusion; neither was tested.
+
+Consequence for the figures: the pair-density panels use a whole-lane normalization, so the off curve sits near 1.6 for a geometric reason. The differences between settings are unaffected. A window normalization (or a saved head-position histogram) would be cleaner and is proposed for the next sweep.
+
+### Runtime per setting
+
+Wall time of one run (30 seeds each, mean +- standard error), steps per run, and time per step. The whole sweep was 330 runs and 205 s.
+
+| Range (nm) | Mode | Run time (s) | Steps per run | Time per step (ms) | Run time vs off |
+|---|---|---|---|---|---|
+| 0 | off | 0.99 +- 0.02 | 1891 +- 27 | 0.522 +- 0.006 | 1.00x |
+| 2 | graded | 0.80 +- 0.02 | 1863 +- 23 | 0.426 +- 0.006 | 0.80x |
+| 2 | hard | 0.72 +- 0.02 | 1780 +- 27 | 0.400 +- 0.005 | 0.72x |
+| 4 | graded | 0.78 +- 0.02 | 1848 +- 25 | 0.422 +- 0.006 | 0.79x |
+| 4 | hard | 0.62 +- 0.01 | 1654 +- 19 | 0.371 +- 0.005 | 0.62x |
+| 8 | graded | 0.71 +- 0.02 | 1751 +- 23 | 0.403 +- 0.005 | 0.71x |
+| 8 | hard | 0.51 +- 0.01 | 1478 +- 14 | 0.344 +- 0.007 | 0.51x |
+| 16 | graded | 0.64 +- 0.01 | 1606 +- 16 | 0.396 +- 0.005 | 0.64x |
+| 16 | hard | 0.36 +- 0.01 | 1228 +- 12 | 0.292 +- 0.004 | 0.36x |
+| 32 | graded | 0.52 +- 0.01 | 1437 +- 16 | 0.360 +- 0.004 | 0.52x |
+| 32 | hard | 0.21 +- 0.00 | 946 +- 7 | 0.222 +- 0.001 | 0.21x |
+
+Steric runs are faster, not slower, and the reason is two effects that I did not separate cleanly:
+
+- Fewer bound PRC1 means fewer terms in the rate list and fewer steps.
+- The steric path draws a site by rejection from the sorted free-site set (O(log n)), while the default path calls `np.random.choice` on the whole free-site set (O(N)). Even the 2 nm graded runs, which end with almost the same number of PRC1 as off (178.6 against 180.2), take 0.426 ms per step against 0.522 ms. This is a pre-existing inefficiency in the default path. It is left alone, because changing that sampler would change the random stream and break exact reproduction of the earlier model.
+
+The update cost of the penalty itself is small: about 13 us for a 40-site (8 nm) update, measured in isolation on the production lattice.
 
 ### Caveats
 
@@ -106,3 +151,4 @@ Earlier baseline fixes (merged into `test/tiffany` before this work, each with a
 3. What interaction range and decay should be used? No verified source; the sweep should inform a plausible span.
 4. Should second-head binding and hopping become steric aware next? The pair-density data show the second-head gap directly.
 5. Should the next sweep vary the decay length and contact factor, and run to a steady state or at a fitted binding rate, so the range is not confounded with density and time?
+6. What causes the 11% deficit in same-lane pair density at 0 to 4 nm with steric off (0.89 of uniform within the overlap)? Not established; see "Why g(d) is about 1.5 with steric off".
