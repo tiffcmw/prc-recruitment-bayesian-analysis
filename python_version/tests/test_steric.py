@@ -327,15 +327,59 @@ def test_steric_with_cooperativity_is_rejected_for_now():
         make_state(steric_range_nm=5.0, enable_cooperativity=True, cooperativity_energy=2.0)
 
 
-@pytest.mark.parametrize("hopping", ["slow", "fast", True])
+@pytest.mark.parametrize("hopping", ["slow", "fast"])
 def test_steric_with_hopping_is_rejected_for_now(hopping):
     with pytest.raises(ValueError, match="hopping"):
         rg.run_gillespie_prc1(4e-5, 1, 10, 0.1, end_time=1, enable_hopping=hopping,
                               steric_range_nm=8.0)
 
 
+def test_enable_hopping_true_never_hops_so_it_is_identical_to_false():
+    # only "slow" and "fast" hop in run_gillespie_prc1; True is a no-op (ISSUES.md, issue 4)
+    runs = []
+    for hopping in (False, True):
+        np.random.seed(11)
+        runs.append(rg.run_gillespie_prc1(4e-5, 1, 10, 0.1, end_time=10, max_steps=500, enable_hopping=hopping))
+    assert list(runs[0][0]) == list(runs[1][0]) and np.array_equal(runs[0][1], runs[1][1])
+
+
+def test_steric_is_allowed_with_the_no_op_enable_hopping_true():
+    np.random.seed(2)
+    stats, times = rg.run_gillespie_prc1(4e-5, 1, 10, 0.1, end_time=3, max_steps=200,
+                                         enable_hopping=True, steric_range_nm=8.0)
+    assert len(stats) > 1
+
+
+def test_grid_runner_works_with_steric_and_default_arguments():
+    # run_gillespie_prc1_on_grid defaults to enable_hopping=True, which is a no-op
+    np.random.seed(2)
+    y = rg.run_gillespie_prc1_on_grid(4e-5, 1, 10, 0.1, np.arange(0, 4, 1.0), max_steps=300, steric_range_nm=2.0)
+    assert y.shape == (4,)
+
+
+def test_a_sub_site_range_is_steric_off_and_therefore_allowed_with_hopping():
+    np.random.seed(2)
+    with pytest.warns(UserWarning, match="below one site"):
+        stats, times = rg.run_gillespie_prc1(4e-5, 1, 10, 0.1, end_time=2, max_steps=100,
+                                             enable_hopping="fast", steric_range_nm=0.1)
+    assert len(stats) > 1
+
+
+def test_sampler_falls_back_to_explicit_sampling_after_too_many_rejections(monkeypatch):
+    np.random.seed(0)
+    state = make_state(microtubule_length=40.0, site_spacing=1.0, steric_range_nm=3.0, steric_mode="hard")
+    for site in (5, 15, 25, 35):
+        occupy(state, "bottom", site)   # blocks 2-8, 12-18, 22-28, 32-38; 13 sites stay free
+    free = {s for s in range(state.num_sites) if state.steric_weight("bottom", s) > 0}
+    assert len(free) == 13
+    monkeypatch.setattr(State, "SAMPLER_MAX_REJECTIONS", 1)
+    draws = [state.sample_binding_site("bottom") for _ in range(600)]
+    assert set(draws) <= free and len(set(draws)) > 6
+
+
 @pytest.mark.parametrize("bad", [dict(steric_contact_factor=-0.1), dict(steric_contact_factor=1.5),
-                                 dict(steric_mode="soft"), dict(steric_decay_nm=0.0)])
+                                 dict(steric_mode="soft"), dict(steric_decay_nm=0.0),
+                                 dict(steric_decay_nm=float("nan")), dict(steric_contact_factor=float("nan"))])
 def test_invalid_parameters_are_rejected(bad):
     with pytest.raises(ValueError):
         make_state(steric_range_nm=5.0, **bad)

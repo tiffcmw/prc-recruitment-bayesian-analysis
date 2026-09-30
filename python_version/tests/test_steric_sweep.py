@@ -2,6 +2,8 @@
 Tests for the sweep tooling (python_version/steric_sweep.py): the driver matches run_gillespie_prc1,
 saved files have the documented fields, and results reload unchanged.
 """
+import warnings
+
 import numpy as np
 import pytest
 
@@ -124,14 +126,17 @@ def synthetic_item(seeds=3, max_sites=20, spacing=1.0):
     attach = np.zeros((seeds, max_sites + 1), dtype=np.int64)
     attach[:, 1:6] = 1               # 5 of 10 attachments have a neighbor within 5 sites
     return dict(site_spacing=spacing, pair_counts=counts, pair_expected=expected, attach_nn_counts=attach,
-                attach_events=np.full(seeds, 10), seed=np.arange(seeds), n_final=np.array([10, 12, 14]),
+                attach_events=np.full(seeds, 10), attach_with_ref=np.full(seeds, 10),
+                attach_expected=np.zeros((seeds, max_sites + 1)),
+                seed=np.arange(seeds), n_final=np.array([10, 12, 14]),
                 runtime_s=np.array([1.0, 1.0, 1.0]))
 
 
 def test_pair_correlation_bins_and_averages_correctly():
     x, mean, sem = ss.pair_correlation(synthetic_item(), bin_nm=4.0, max_nm=20.0)
     assert np.allclose(mean, 2.0) and np.allclose(sem, 0.0)
-    assert np.allclose(x, [2.0, 6.0, 10.0, 14.0, 18.0])   # centers of 4 nm bins starting at 0
+    # bins cover sites 1-4, 5-8, ...; the center of sites 1..4 is 2.5 sites (a bin from 0 would start at 0)
+    assert np.allclose(x, [2.5, 6.5, 10.5, 14.5, 18.5])
 
 
 def test_attach_fraction_is_cumulative_and_bounded():
@@ -172,6 +177,166 @@ def test_figures_regenerate_from_saved_results_without_simulating(tmp_path, monk
     paths = ss.make_figures(tmp_path, tmp_path / "figs")
     assert [p.name for p in paths] == ["binding_profile.png", "pair_profile.png", "attach_profile.png", "summary.png"]
     assert all(p.exists() and p.stat().st_size > 2000 for p in paths)
+
+
+# ---------------------------------------------------------------- fixes from the fresh-context review
+
+class FakeState:
+    """Just enough of State for the pair accumulator: sorted taken sites per lane."""
+    def __init__(self, num_sites, bottom, top=()):
+        self.num_sites = num_sites
+        self.bottom_taken_sites = sorted(bottom)
+        self.top_taken_sites = sorted(top)
+
+
+def test_overlap_windows_follow_the_offset():
+    lat = dict(ss.PRODUCTION_LATTICE)   # 5000 nm, 0.2 nm sites, offset 2000 nm
+    assert ss.overlap_windows(lat) == {"bottom": (10000, 25000), "top": (0, 15000)}
+    assert ss.overlap_windows(dict(lat, microtubule_offset=-2000)) == {"bottom": (0, 15000), "top": (10000, 25000)}
+    whole = {"bottom": (0, 25000), "top": (0, 25000)}
+    assert ss.overlap_windows(dict(lat, microtubule_offset=9000)) == whole   # no overlap: whole lane
+
+
+def test_pair_expectation_is_one_for_heads_uniform_inside_the_overlap():
+    # 40 heads uniform inside a 60% window: the whole-lane normalization gives about 1 / 0.6 (the
+    # artifact the review found); the window normalization gives about 1.
+    rng = np.random.default_rng(0)
+    n_sites, lo, hi, max_d = 25001, 10000, 25000, 100
+    windows = {"bottom": (lo, hi), "top": (0, hi - lo)}
+    counts_w = np.zeros(max_d + 1); expected_w = np.zeros(max_d + 1)
+    counts_l = np.zeros(max_d + 1); expected_l = np.zeros(max_d + 1)
+    for _ in range(1500):
+        heads = rng.choice(np.arange(lo, hi + 1), size=60, replace=False)
+        state = FakeState(n_sites, heads)
+        c, e, *_ = ss._accumulate_pairs(state, max_d, windows)
+        counts_w += c; expected_w += e
+        c, e, *_ = ss._accumulate_pairs(state, max_d, None)
+        counts_l += c; expected_l += e
+    assert counts_w[1:].sum() / expected_w[1:].sum() == pytest.approx(1.0, rel=0.05)
+    assert counts_l[1:].sum() / expected_l[1:].sum() == pytest.approx(1 / 0.6, rel=0.05)
+
+
+def test_pair_accumulator_reports_the_fraction_of_heads_in_the_window():
+    state = FakeState(1000, [5, 500, 600, 700], [10, 20])
+    windows = {"bottom": (400, 999), "top": (0, 599)}
+    *_, in_window, total = ss._accumulate_pairs(state, 50, windows)
+    assert (in_window, total) == (5, 6)
+
+
+def test_uniform_binding_cdf_matches_brute_force():
+    heads, n_sites, max_d = [3, 10], 15, 6
+    free = [s for s in range(n_sites) if s not in heads]
+    nearest = np.array([min(abs(s - h) for h in heads) for s in free])
+    brute = np.array([(nearest <= d).sum() / len(free) for d in range(max_d + 1)])
+    assert np.allclose(ss._uniform_binding_cdf(heads, n_sites, max_d), brute)
+
+
+def test_attach_enrichment_is_one_for_uniform_binding_and_zero_inside_a_hard_footprint():
+    rng = np.random.default_rng(3)
+    n_sites, max_d, draws = 4000, 60, 60000
+    heads = np.sort(rng.choice(n_sites, size=40, replace=False))
+    free = np.setdiff1d(np.arange(n_sites), heads)
+    nearest = np.abs(free[:, None] - heads[None, :]).min(axis=1)
+    cdf = ss._uniform_binding_cdf(list(heads), n_sites, max_d)
+
+    def item_from(sites):
+        near = np.abs(sites[:, None] - heads[None, :]).min(axis=1)
+        hist = np.bincount(near[near <= max_d], minlength=max_d + 1)[None, :]
+        return dict(site_spacing=1.0, attach_nn_counts=hist, attach_with_ref=np.array([len(sites)]),
+                    attach_expected=(len(sites) * cdf)[None, :])
+
+    uniform = item_from(rng.choice(free, size=draws))
+    d, mean, sem = ss.attach_enrichment(uniform, max_nm=40.0)
+    assert np.allclose(mean[10:], 1.0, atol=0.06)
+    hard = item_from(rng.choice(free[nearest > 8], size=draws))
+    d, mean, sem = ss.attach_enrichment(hard, max_nm=40.0)
+    assert np.all(mean[1:9] == 0.0) and mean[40] < 1.0
+
+
+def test_mean_sem_of_a_single_seed_is_nan_not_zero():
+    mean, sem = ss._mean_sem(np.array([[1.0, 2.0]]))
+    assert np.allclose(mean, [1.0, 2.0]) and np.all(np.isnan(sem))
+
+
+def test_mean_sem_with_sparse_columns_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mean, sem = ss._mean_sem(np.array([[1.0, np.nan, np.nan], [3.0, np.nan, np.nan], [5.0, 2.0, np.nan]]))
+    assert sem[0] == pytest.approx(2.0 / np.sqrt(3)) and np.isnan(sem[1]) and np.isnan(sem[2])
+
+
+def test_attach_denominator_excludes_attachments_onto_an_empty_lane():
+    cfg = tiny_config()
+    np.random.seed(1)
+    state = ss.RecordingState(**cfg.lattice, **cfg.rates, max_distance_sites=cfg.max_distance_sites)
+    for _ in range(30):
+        state.single_attach_prc1()
+    empty_lane_attaches = state.attach_events - state.attach_with_ref
+    assert state.attach_events == 30 and empty_lane_attaches in (1, 2)   # at most one per lane
+    assert state.attach_nn_counts.sum() <= state.attach_with_ref
+
+
+def test_a_fraction_of_one_is_reachable():
+    item = synthetic_item(seeds=2, max_sites=10)
+    item["attach_nn_counts"][:] = 0
+    item["attach_nn_counts"][:, 2] = 10          # every attachment lands 2 sites from a bound head
+    d, mean, sem = ss.attach_fraction_within(item, max_nm=10.0)
+    assert mean[-1] == pytest.approx(1.0) and mean[1] == 0.0
+
+
+def test_stale_files_from_an_earlier_sweep_do_not_mix_into_a_new_one(tmp_path):
+    ss.run_sweep(tiny_config(ranges_nm=(0.0, 4.0)), tmp_path, verbose=False)
+    ss.run_sweep(tiny_config(ranges_nm=(0.0, 6.0)), tmp_path, verbose=False)
+    assert set(ss.load_results(tmp_path)) == {(0.0, "off"), (6.0, "graded"), (6.0, "hard")}
+    assert not list(tmp_path.glob("range_4*"))
+
+
+def test_files_not_listed_in_the_manifest_are_ignored(tmp_path):
+    ss.run_sweep(tiny_config(), tmp_path, verbose=False)
+    stray = next(tmp_path.glob("range_*_graded.npz"))
+    with np.load(stray) as data:
+        fields = {k: data[k] for k in data.files}
+    fields["range_nm"] = np.array(99.0)   # a file from some other sweep that reports a different range
+    np.savez(tmp_path / "range_99nm_graded.npz", **fields)
+    results = ss.load_results(tmp_path)
+    assert (99.0, "graded") not in results and len(results) == 3
+
+
+def test_small_ranges_get_distinct_file_names():
+    assert ss.setting_name(0.001, "graded") != ss.setting_name(0.004, "graded")
+    assert ss.setting_name(8.0, "hard") == "range_8nm_hard"
+
+
+def test_a_truncated_run_is_flagged_and_gives_no_pair_statistics():
+    cfg = tiny_config(max_steps=20, end_time=50.0)
+    with pytest.warns(UserWarning, match="truncated"):
+        out = ss.run_one(cfg, 4.0, "graded", seed=0)
+    assert out["truncated"] and out["end_time_reached"] < cfg.end_time
+    assert out["pair_counts"].sum() == 0 and out["pair_expected"].sum() == 0
+
+
+def test_a_normal_run_is_not_truncated():
+    out = ss.run_one(tiny_config(), 4.0, "graded", seed=0)
+    assert not out["truncated"] and 0.0 <= out["window_fraction"] <= 1.0
+
+
+def test_config_rejects_a_range_below_one_site_instead_of_running_it_as_steric_off():
+    with pytest.raises(ValueError, match="below one site"):
+        ss.SweepConfig(ranges_nm=(0.0, 0.1)).validate()
+    ss.SweepConfig(ranges_nm=(0.0, 0.2)).validate()   # exactly one site is fine
+
+
+def test_command_line_rejects_empty_or_unresolvable_settings(tmp_path):
+    with pytest.raises(ValueError, match="below one site"):
+        ss.main(["run", "--out", str(tmp_path), "--ranges", "0", "0.1", "--seeds", "1"])
+    with pytest.raises(ValueError, match="seeds"):
+        ss.main(["run", "--out", str(tmp_path), "--ranges", "0", "4", "--seeds", "0"])
+
+
+def test_summary_includes_the_density_controlled_enrichment(tmp_path):
+    ss.run_sweep(tiny_config(), tmp_path, verbose=False)
+    rows = ss.summarize(ss.load_results(tmp_path))
+    assert all("attach_enrichment_8nm_mean" in r for r in rows)
 
 
 def test_summary_panels_do_not_share_a_y_axis(tmp_path):
