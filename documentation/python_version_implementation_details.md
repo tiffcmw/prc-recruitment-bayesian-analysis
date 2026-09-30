@@ -56,4 +56,10 @@ The prc1 class also comes with helpful properties that compute the rates, and al
 ### Computing Rates
 The code precomputes attachment rates, since these would be very expensive to recompute every timestep. 
 
+### Steric blocking
+Optional, off by default (`steric_range_nm=0`). `range_nm_to_sites` in prc1_state.py is the only place a range in nm becomes a whole number of sites, and `State.steric_range_sites` exposes the result. When on, each lane's taken-site set (`SortedSetAndComplement`) owns a `StericField`. The field keeps, per site, the product of the distance factors of the occupied sites within range, a count of hard blockers, and a running total of the weights of the free sites. `SortedSetAndComplement.add/remove/discard` call `occupy`/`release`, so attach, detach and hop all stay in sync through the existing `Prc1` setters. An update touches at most 2 * range_sites neighbors. The single-head binding rate of a lane is `initial_binding_rate_per_site * total`, and `State.sample_binding_site(lane)` draws a site by rejection with acceptance probability equal to its weight. Because the weights are at most 1, the draw is exact. Second-head binding, cooperativity and hopping are not steric aware yet (ISSUES.md, issue 3).
+
+### Lattice units
+Lengths are in nm. The production lattice (5000 nm, 0.2 nm spacing, 25001 sites per lane) differs from the 8 nm dimer spacing in the CyLaKS papers; see ISSUES.md, issue 2. Same-site exclusion is the only exclusion between heads unless steric blocking is switched on.
+
 This is an incomplete document, will finish later - Adrian.

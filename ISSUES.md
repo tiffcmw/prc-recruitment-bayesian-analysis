@@ -1,6 +1,6 @@
 # Open issues
 
-Logged, not fixed. Line numbers refer to `python_version/` on `test/tiffany` at commit 20a0fcd.
+Logged, not fixed. Issue 1 line numbers refer to `python_version/` at commit 20a0fcd; issue 2 and 3 line numbers refer to the `feat/steric-blocking` branch.
 
 ## 1. Cooperativity acts on singly attached PRC1 (intent: both heads attached only)
 
@@ -25,13 +25,43 @@ If cooperativity should apply only when both heads are attached:
 - Revisit `fast_hop` (`prc1_state.py:461`, `:501`) for singly attached PRC1.
 - Effect on results: lower single-head recruitment near occupied sites and a different singly attached detachment rate. The size of the effect depends on `Ec`.
 
-The steric blocking implementation is written to be independent of this choice, so either resolution works later.
+The steric blocking implementation is independent of this choice (it currently refuses to run together with cooperativity, see issue 3), so either resolution works later.
 
 ## 2. Site spacing 0.2 nm versus 8 nm tubulin dimer spacing
 
-Status: open, reported, not changed.
+Status: open, reported, not changed. A regression test (`python_version/tests/test_lattice_pin.py`) pins the current lattice so any change is deliberate.
 
-- `run_gillespie.py:14-16` sets `microtubule_length = 5000`, `site_spacing = 0.2`, `microtubule_offset = 2000`. The code treats these as nm (`prc1_state.get_distance_between_indices` docstring, and `prc1System.h:18` comments the sites in nm). That gives 25001 sites per lane.
-- The C++ port (`prc1sim.cpp:440-442`) and `upstream/main` use the same values.
-- Both local CyLaKS papers use 8 nm: Steckhahn et al. (bioRxiv 2024.12.31.630898, Table 1, delta = 8 nm) and Fiorenza et al. (2021, Eur. Phys. J. E 44:105, site size 8 nm, one site per tubulin dimer). At 8 nm, a 5000 nm lattice would have 626 sites.
-- Consequence: same-site exclusion and adjacent-site cooperativity act over 0.2 nm, not over a dimer. The spring and precomputed double-attach rates use the horizontal offset in nm, so the fine grid may be an intentional continuous-position approximation, but that is unconfirmed.
+### Evidence
+
+| Quantity | Code (Python, C++ port, `upstream/main`) | CyLaKS papers | Match |
+|---|---|---|---|
+| Microtubule length | `5000`, in nm, so 5 um (`run_gillespie.py:14`, `prc1sim.cpp:440`) | Steckhahn et al. (bioRxiv 2024.12.31.630898), Table 1: Lm = 5 um | Yes |
+| Site spacing | `0.2`, in nm (`run_gillespie.py:15`, `prc1sim.cpp:441`) | Steckhahn Table 1: delta = 8 nm (cites Howard). Fiorenza et al. (2021, Eur. Phys. J. E 44:105): site size 8 nm, one site per tubulin dimer | **No, 40x finer** |
+| Sites per lane | 5000 / 0.2 + 1 = 25001 (`prc1_state.py:236`) | 5000 / 8 = 625 dimers, about 626 sites | **No** |
+| Thermal energy, spring constant, rest length, separation | 4.1, 2, 32, 32 | 4.1 pN nm, 2 pN/nm, 32 nm | Yes |
+| Offset | `2000` nm, leaving 3 um of overlap | Initial overlap 5 um, aligned | Different setup, not a units error |
+
+The unit is nm because `get_distance_between_indices` (`prc1_state.py:788`) documents its result as nm and `prc1System.h:18` describes the sites as positions in nm. Python, C++ and `upstream/main` all use 0.2, and it has not changed since the first Python commit. Nothing in the repository explains it.
+
+### What depends on the spacing (finding, not a conclusion)
+
+- The number of sites (`prc1_state.py:236`), and with it the total single-attach propensity, which is per-site rate times free sites. The fitted `initial_binding_rate_per_site` is therefore only meaningful for this lattice and cannot be compared with a per-dimer literature rate.
+- The precomputed double-attach table, sized `2 * num_sites + 1` rows over horizontal offsets in units of `site_spacing` (`prc1_state.py:746-752`), and the lookups that convert between the two lattices (`prc1.py:168`, `:173`).
+- Lattice alignment: 2000 / 0.2 = 10000 is an integer, and 2000 / 8 = 250 is too, so the two lattices stay aligned either way.
+- Spring extension resolution. The double-attach and detachment rates depend on the spring energy `0.5 * k * (d - rest)^2` with `d = sqrt(h^2 + 32^2)`. Between horizontally adjacent sites this changes by about 0.24 kT at an 8 nm step from zero offset, 3.5 kT at 16 nm, 15.6 kT at 24 nm and 42.9 kT at 32 nm. At 0.2 nm the step is negligible, so the fine grid resolves the extension almost continuously. That is a plausible reason for the fine grid, but I found no statement of intent, so it is unconfirmed.
+- Hopping. `base_hopping_rate = 1` (`run_gillespie.py:28`) is not scaled by the spacing. If the rate is per second per direction, a 0.2 nm hop gives D = k a^2 = 0.04 nm^2/s, against 0.13 um^2/s (1.3e5 nm^2/s) for singly bound PRC1 in Steckhahn Table 1. The time unit of the model rates is not stated anywhere I found, so this is arithmetic under an assumption, flagged unverified.
+
+### Existing steric exclusion at this spacing
+
+The only exclusion is same-site. The `taken` sets prevent two heads on one site and nothing else: two heads on the same lane at sites 100 and 101 (0.2 nm apart) are accepted (`Prc1` setters do not check neighbors), and `single_attach_prc1` samples uniformly from the untaken sites, so site 101 stays available while 100 is taken. Doubly attached PRC1 additionally cannot cross. At 0.2 nm a PRC1 therefore has an effective footprint of 0.2 nm, and cooperativity "adjacent" means 0.2 nm apart. The new steric penalty adds to this (same-site exclusion stays as is) and only applies when a range is set; see issue 3.
+
+## 3. Scope limits of the steric blocking implementation
+
+Status: by design for the first version.
+
+Steric blocking (`steric_range_nm`, default 0 nm, off) currently applies to single-head binding only:
+
+- Not combinable with cooperativity. `State` raises `ValueError`, because the cooperative adjacency categories would need per-category steric sums. Depends on the outcome of issue 1.
+- Not combinable with hopping. `run_gillespie_prc1` raises `ValueError`, because hopping can move a head inside another head's range and would need a matching factor to stay consistent with detailed balance. Note that `run_gillespie_prc1_on_grid` defaults to `enable_hopping=True`, so pass `enable_hopping=False` explicitly.
+- Second-head binding (the double-attach cumulative-sum fast path) does not see the penalty, so a second head can still land inside the range of a head on the other lane.
+- The distance law is a working hypothesis, not a literature result. No verified source in `papers/` gives a graded distance dependence for PRC1 on microtubules.
