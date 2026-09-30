@@ -262,7 +262,7 @@ class State:
             raise ValueError(f"steric_mode must be 'graded' or 'hard', got {steric_mode!r}")
         if not 0.0 <= steric_contact_factor <= 1.0:
             raise ValueError(f"steric_contact_factor must be in [0, 1], got {steric_contact_factor}")
-        if steric_decay_nm is not None and steric_decay_nm <= 0:
+        if steric_decay_nm is not None and not steric_decay_nm > 0:   # also rejects NaN
             raise ValueError(f"steric_decay_nm must be positive, got {steric_decay_nm}")
         self.steric_range_nm = steric_range_nm
         self.steric_mode = steric_mode
@@ -314,6 +314,8 @@ class State:
         return num_doubly_adjacent_sites * double_cooperativity_rate
 
     # steric blocking
+    SAMPLER_MAX_REJECTIONS = 10_000   # rejection draws before falling back to explicit weighted sampling
+
     @property
     def steric_active(self):
         return self.steric_range_sites > 0
@@ -355,10 +357,17 @@ class State:
         num_untaken = len(untaken)
         if field.total <= 0 or num_untaken == 0:
             raise RuntimeError(f"no {lane} site is available under steric blocking")
-        while True:
+        for _ in range(self.SAMPLER_MAX_REJECTIONS):
             site = untaken[int(np.random.random() * num_untaken)]
             if np.random.random() < field.site_weight(site):
                 return site
+        # Almost every free site is blocked, so rejection is too slow (or the weights are all tiny): draw
+        # directly from the cumulative weights. This is exact too, and O(number of free sites).
+        cumulative = np.cumsum([field.site_weight(s) for s in untaken])
+        if cumulative[-1] <= 0:
+            raise RuntimeError(f"no {lane} site is available under steric blocking")
+        index = np.searchsorted(cumulative, np.random.random() * cumulative[-1], side="right")
+        return untaken[int(min(index, num_untaken - 1))]
 
     @property
     def uncooperative_initial_binding_rates(self):

@@ -9,13 +9,22 @@ Run (from the repo root):
 `plot` only reads those files, so figures can be regenerated without rerunning simulations.
 The results folder is gitignored.
 
-What is measured per seed (same seeds are used for every setting, so settings are paired):
-  pair_counts / pair_expected  head pairs on the same lane at distance d sites, and the count expected
-                               if heads were placed uniformly at random (occupancy profile near an
-                               occupied head; g(d) = counts / expected). Pooled over late-time snapshots.
+What is measured per seed. The same seed list is used for every setting, but these are not common random
+numbers: the steric sampler draws different random numbers from the default one, so runs diverge at the
+first attachment and settings are effectively independent samples.
+  pair_counts / pair_expected  head pairs on the same lane at distance d sites, and the count expected if
+                               heads were placed uniformly at random inside the overlap of the two
+                               microtubules (where almost all heads are; see overlap_windows). g(d) =
+                               counts / expected, so g = 1 means no correlation. Pooled over late snapshots.
   attach_nn_counts             distance (sites) from each newly attached first head to the nearest
-                               same-lane head that was already bound (an empirical binding profile).
+                               same-lane head that was already bound.
+  attach_with_ref              number of first-head attachments that had a bound head on the same lane
+                               (the denominator; attachments onto an empty lane have no reference head).
+  attach_expected              the same distances if each attachment had picked a free site uniformly
+                               (no steric effect), given the occupancy at that moment. Observed over
+                               expected therefore removes the dependence on density (attach_enrichment).
   n_final, runtime_s           PRC1 count at the end of the run and wall time of the simulation.
+  truncated                    the run hit max_steps before end_time; its pair statistics are left empty.
 Per setting (deterministic, from the model):
   profile_distance_nm / profile_weight   relative binding rate of a free site at distance d from one
                                occupied site (the binding-rate profile).
@@ -27,8 +36,11 @@ import argparse
 import bisect
 import csv
 import json
+import math
+import os
 import subprocess
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -36,7 +48,7 @@ import numpy as np
 
 from gillespie import run_gillespie
 from prc1 import Prc1
-from prc1_state import State
+from prc1_state import State, range_nm_to_sites
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "results" / "steric_sweep"
@@ -77,21 +89,71 @@ class SweepConfig:
         out += [(r, m) for r in self.ranges_nm if r > 0 for m in self.modes]
         return out
 
+    def validate(self):
+        """Refuse configurations that would silently run something other than what was asked for."""
+        if not self.seeds:
+            raise ValueError("seeds must not be empty")
+        if not self.settings():
+            raise ValueError("no settings to run: give at least one range")
+        spacing = self.lattice["site_spacing"]
+        for range_nm in self.ranges_nm:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sites = range_nm_to_sites(range_nm, spacing)   # also rejects negative and non-finite
+            if range_nm > 0 and sites < 1:
+                raise ValueError(f"range {range_nm} nm is below one site ({spacing} nm); it would run as steric "
+                                 "off under a steric label. Use 0 for off or a range of at least one site.")
+
 
 def setting_name(range_nm, mode):
-    return f"range_{range_nm:07.2f}nm_{mode}"
+    return f"range_{range_nm:g}nm_{mode}"
+
+
+def overlap_windows(lattice):
+    """
+    Inclusive site ranges, in each lane's own index, where the two microtubules overlap. Nearly all heads
+    sit there (doubly attached PRC1 need a partner on the other lane), so pair statistics are normalized
+    to this window instead of the whole lane. Without an overlap the whole lane is used.
+    """
+    spacing = lattice["site_spacing"]
+    n = int(lattice["microtubule_length"] / spacing) + 1
+    offset = int(round(lattice["microtubule_offset"] / spacing))   # top lane origin, in bottom lane sites
+    if abs(offset) >= n:
+        return {"bottom": (0, n - 1), "top": (0, n - 1)}
+    if offset >= 0:
+        return {"bottom": (offset, n - 1), "top": (0, n - 1 - offset)}
+    return {"bottom": (0, n - 1 + offset), "top": (-offset, n - 1)}
+
+
+def _uniform_binding_cdf(heads, num_sites, max_d):
+    """
+    P(nearest bound head is within d sites) for d = 0..max_d, if a free site of this lane were chosen
+    uniformly (no steric effect). Exact, from the gaps between the sorted heads. It is the null the
+    attachment profile is compared with, and it depends on the occupancy at the moment of attachment.
+    """
+    h = np.asarray(heads)
+    d = np.arange(max_d + 1)
+    within = np.minimum(h[0], d) + np.minimum(num_sites - 1 - h[-1], d)          # the two ends of the lane
+    if len(h) > 1:
+        within = within + np.minimum((np.diff(h) - 1)[:, None], 2 * d[None, :]).sum(axis=0)   # gaps between heads
+    return within / (num_sites - len(h))
 
 
 # ------------------------------------------------------------------ simulation
 
 class RecordingState(State):
-    """State that records, for every single-head attachment, the distance to the nearest bound head."""
+    """
+    State that records, for every first-head attachment onto a lane that already has a bound head, the
+    distance to the nearest bound head, and what that distance would be if the free site were chosen uniformly.
+    """
 
     def __init__(self, *args, max_distance_sites=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_distance_sites = max_distance_sites
         self.attach_nn_counts = np.zeros(max_distance_sites + 1, dtype=np.int64)
+        self.attach_expected = np.zeros(max_distance_sites + 1)
         self.attach_events = 0
+        self.attach_with_ref = 0
 
     def single_attach_prc1(self):
         before = (list(self.bottom_taken_sites), list(self.top_taken_sites))
@@ -99,7 +161,9 @@ class RecordingState(State):
         self.attach_events += 1
         for lane_before, taken in zip(before, (self.bottom_taken_sites, self.top_taken_sites)):
             if len(taken) == len(lane_before) or not lane_before:
-                continue
+                continue   # the other lane, or the first head on an empty lane (no reference head)
+            self.attach_with_ref += 1
+            self.attach_expected += _uniform_binding_cdf(lane_before, self.num_sites, self.max_distance_sites)
             (new_site,) = set(taken).difference(lane_before)
             i = bisect.bisect_left(lane_before, new_site)
             nearest = min(abs(new_site - lane_before[j]) for j in (i - 1, i) if 0 <= j < len(lane_before))
@@ -138,54 +202,78 @@ def simulate(state, end_time, max_steps, statistic_function=None):
                          np.inf, max_steps, lambda s, t, dt: None)
 
 
-def _accumulate_pairs(state, max_d, counts, expected):
-    """Add same-lane head pairs at distance 1..max_d sites, and their uniform-placement expectation."""
+def _accumulate_pairs(state, max_d, windows=None):
+    """
+    Same-lane head pairs at distance 1..max_d sites among heads inside `windows` (per-lane inclusive site
+    ranges; the whole lane if None), and the pairs expected if those heads were uniform inside the window.
+    Returns (counts, expected, heads_in_window, heads_total).
+    """
+    counts = np.zeros(max_d + 1)
+    expected = np.zeros(max_d + 1)
     distances = np.arange(max_d + 1)
-    for taken in (state.bottom_taken_sites, state.top_taken_sites):
-        sites = list(taken)
-        n = len(sites)
-        if n < 2:
+    in_window = total = 0
+    for lane, taken in (("bottom", state.bottom_taken_sites), ("top", state.top_taken_sites)):
+        lo, hi = windows[lane] if windows else (0, state.num_sites - 1)
+        sites = [s for s in taken if lo <= s <= hi]
+        total += len(taken)
+        in_window += len(sites)
+        n, width = len(sites), hi - lo + 1
+        if n < 2 or width < 2:
             continue
         for i, site in enumerate(sites):
             j = i + 1
             while j < n and sites[j] - site <= max_d:
                 counts[sites[j] - site] += 1
                 j += 1
-        expected += (n * (n - 1) / 2) * (state.num_sites - distances) / (state.num_sites * (state.num_sites - 1) / 2)
-    return counts, expected
+        expected += (n * (n - 1) / 2) * np.maximum(width - distances, 0) / (width * (width - 1) / 2)
+    return counts, expected, in_window, total
 
 
 def run_one(cfg, range_nm, mode, seed):
     """One seeded simulation; returns the measurements listed in the module docstring."""
     steric_mode = "graded" if mode == "off" else mode
-    max_d = cfg.max_distance_sites
+    max_d = min(cfg.max_distance_sites, int(cfg.lattice["microtubule_length"] / cfg.lattice["site_spacing"]))
     state = RecordingState(
         **cfg.lattice, **cfg.rates, max_distance_sites=max_d,
         steric_range_nm=range_nm, steric_mode=steric_mode, steric_contact_factor=cfg.contact_factor,
     )
+    windows = overlap_windows(cfg.lattice)
     counts = np.zeros(max_d + 1)
     expected = np.zeros(max_d + 1)
+    heads_in_window = heads_total = 0
     snapshot_times = [f * cfg.end_time for f in cfg.snapshot_fractions]
     taken_snapshots = 0
 
     def statistic(s, stat_list, time_):
-        nonlocal taken_snapshots
+        nonlocal taken_snapshots, heads_in_window, heads_total
         stat_list.append(len(s))
         while taken_snapshots < len(snapshot_times) and time_ >= snapshot_times[taken_snapshots]:
-            _accumulate_pairs(s, max_d, counts, expected)
+            c, e, in_window, total = _accumulate_pairs(s, max_d, windows)
+            counts[:] += c
+            expected[:] += e
+            heads_in_window += in_window
+            heads_total += total
             taken_snapshots += 1
 
     np.random.seed(seed)
     t0 = time.perf_counter()
     statistics, times = simulate(state, cfg.end_time, cfg.max_steps, statistic)
     runtime = time.perf_counter() - t0
-    if taken_snapshots == 0:   # run ended early (max_steps): use the final state
-        _accumulate_pairs(state, max_d, counts, expected)
+    truncated = bool(times[-1] < cfg.end_time)
+    if truncated:
+        # the run stopped in the transient, before the snapshot times: report it and keep no pair statistics
+        warnings.warn(f"run truncated at max_steps={cfg.max_steps} (reached t={times[-1]:.2f} of {cfg.end_time}); "
+                      "pair statistics are left empty for this run", UserWarning, stacklevel=2)
+        counts[:] = 0.0
+        expected[:] = 0.0
+        heads_in_window = heads_total = 0
     expected[0] = 0.0
     return dict(
         pair_counts=counts, pair_expected=expected, attach_nn_counts=state.attach_nn_counts.copy(),
+        attach_expected=state.attach_expected.copy(), attach_with_ref=state.attach_with_ref,
         n_final=len(state), attach_events=state.attach_events, runtime_s=runtime, steps=len(times),
-        end_time_reached=float(times[-1]),
+        end_time_reached=float(times[-1]), truncated=truncated,
+        window_fraction=heads_in_window / heads_total if heads_total else float("nan"),
     )
 
 
@@ -216,9 +304,16 @@ def run_setting(cfg, range_nm, mode, out_dir, verbose=True):
     runs = [run_one(cfg, range_nm, mode, seed) for seed in cfg.seeds]
     distance_nm, weight, range_sites = binding_profile(cfg, range_nm, mode)
     path = Path(out_dir) / f"{setting_name(range_nm, mode)}.npz"
+    partial = path.with_name(path.stem + ".partial.npz")   # written fully, then renamed, so no half-written file
+    windows = overlap_windows(cfg.lattice)
     np.savez_compressed(
-        path,
+        partial,
         seed=np.array(cfg.seeds), range_nm=range_nm, mode=mode, range_sites=range_sites,
+        truncated=np.array([r["truncated"] for r in runs]),
+        window_fraction=np.array([r["window_fraction"] for r in runs]),
+        pair_window_bottom=np.array(windows["bottom"]), pair_window_top=np.array(windows["top"]),
+        attach_with_ref=np.array([r["attach_with_ref"] for r in runs]),
+        attach_expected=np.array([r["attach_expected"] for r in runs]),
         contact_factor=cfg.contact_factor, site_spacing=cfg.lattice["site_spacing"],
         rate_per_site=cfg.rates["initial_binding_rate_per_site"],
         runtime_s=np.array([r["runtime_s"] for r in runs]),
@@ -232,6 +327,7 @@ def run_setting(cfg, range_nm, mode, out_dir, verbose=True):
         profile_distance_nm=distance_nm, profile_weight=weight,
         config_json=json.dumps(asdict(cfg), default=list),
     )
+    os.replace(partial, path)
     if verbose:
         mean_n = np.mean([r["n_final"] for r in runs])
         total = sum(r["runtime_s"] for r in runs)
@@ -240,8 +336,12 @@ def run_setting(cfg, range_nm, mode, out_dir, verbose=True):
 
 
 def run_sweep(cfg, out_dir=DEFAULT_OUT, verbose=True):
+    """Run every setting and save it. Files from an earlier sweep in `out_dir` are removed first."""
+    cfg.validate()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in [*out_dir.glob("range_*.npz"), out_dir / "summary.csv", out_dir / "manifest.json"]:
+        stale.unlink(missing_ok=True)
     rows, paths = [], []
     for range_nm, mode in cfg.settings():
         path, runs = run_setting(cfg, range_nm, mode, out_dir, verbose)
@@ -266,65 +366,98 @@ def run_sweep(cfg, out_dir=DEFAULT_OUT, verbose=True):
 # ------------------------------------------------------------------ loading
 
 def load_results(results_dir=DEFAULT_OUT):
-    """Load every setting saved by `run`. Returns {(range_nm, mode): dict of arrays and scalars}."""
+    """
+    Load the settings listed in manifest.json (written last, so an interrupted sweep has none), and only
+    those, so files left over from another sweep are never mixed in.
+    Returns {(range_nm, mode): dict of arrays and scalars}.
+    """
+    results_dir = Path(results_dir)
+    manifest = results_dir / "manifest.json"
+    if not manifest.exists():
+        raise FileNotFoundError(f"no manifest.json in {results_dir}; run the sweep first "
+                                "(an interrupted sweep leaves no manifest)")
     results = {}
-    for path in sorted(Path(results_dir).glob("range_*.npz")):
-        with np.load(path, allow_pickle=False) as data:
+    for name in json.loads(manifest.read_text())["files"]:
+        with np.load(results_dir / name, allow_pickle=False) as data:
             item = {k: data[k] for k in data.files}
         for key in ("range_nm", "site_spacing", "rate_per_site", "contact_factor"):
             item[key] = float(item[key])
         item["mode"] = str(item["mode"])
         item["range_sites"] = int(item["range_sites"])
         results[(item["range_nm"], item["mode"])] = item
-    if not results:
-        raise FileNotFoundError(f"no range_*.npz files in {results_dir}; run the sweep first")
     return results
 
 
 # ------------------------------------------------------------------ aggregation (reads loaded results only)
 
 def _mean_sem(values):
-    """Mean and standard error across seeds (axis 0), ignoring NaN."""
+    """
+    Mean and standard error across seeds (axis 0), ignoring NaN. The standard error is NaN, not 0,
+    where fewer than two seeds have a value: one seed says nothing about the spread.
+    """
     values = np.asarray(values, dtype=float)
     n = np.sum(~np.isnan(values), axis=0)
-    mean = np.nanmean(values, axis=0)
-    sem = np.nanstd(values, axis=0, ddof=1) / np.sqrt(np.maximum(n, 1)) if values.shape[0] > 1 else np.zeros_like(mean)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # empty or single-value columns are handled below
+        mean = np.nanmean(values, axis=0)
+        std = np.nanstd(values, axis=0, ddof=1)
+    sem = np.where(n >= 2, std / np.sqrt(np.maximum(n, 1)), np.nan)
     return mean, sem
 
 
 def pair_correlation(item, bin_nm=4.0, max_nm=64.0):
     """
-    g(d) binned in nm: same-lane head pairs divided by the pairs expected under uniform placement,
-    computed per seed, then mean and standard error across seeds. Returns (centers_nm, mean, sem).
+    g(d) binned in nm: same-lane head pairs divided by the pairs expected under uniform placement inside
+    the overlap window, computed per seed, then mean and standard error across seeds (seeds with no
+    expected pairs in a bin, such as truncated runs, are left out). Returns (centers_nm, mean, sem).
     """
     spacing = item["site_spacing"]
     bin_sites = max(1, int(round(bin_nm / spacing)))
     max_sites = min(int(round(max_nm / spacing)), item["pair_counts"].shape[1] - 1)
     starts = np.arange(1, max_sites + 1, bin_sites)
+    ends = np.minimum(starts + bin_sites - 1, max_sites)
     per_seed = []
     for counts, expected in zip(item["pair_counts"], item["pair_expected"]):
-        c = np.array([counts[s:s + bin_sites].sum() for s in starts])
-        e = np.array([expected[s:s + bin_sites].sum() for s in starts])
-        per_seed.append(np.where(e > 0, c / np.where(e > 0, e, 1), np.nan))
+        c = np.array([counts[s:e + 1].sum() for s, e in zip(starts, ends)])
+        ex = np.array([expected[s:e + 1].sum() for s, e in zip(starts, ends)])
+        per_seed.append(np.where(ex > 0, c / np.where(ex > 0, ex, 1), np.nan))
     mean, sem = _mean_sem(per_seed)
-    return (starts - 1 + bin_sites / 2.0) * spacing, mean, sem
+    return (starts + ends) / 2.0 * spacing, mean, sem
 
 
 def attach_fraction_within(item, max_nm=40.0):
     """
-    Fraction of first-head attachments that land within d nm of a head already bound on the same lane,
-    per seed, then mean and standard error. Returns (distance_nm, mean, sem).
+    Fraction of first-head attachments, among those with a bound head on the same lane, that land within d nm
+    of the nearest bound head, per seed, then mean and standard error. It depends on how crowded the lane
+    is, so compare settings through attach_enrichment. Returns (distance_nm, mean, sem).
     """
     spacing = item["site_spacing"]
     max_sites = min(int(round(max_nm / spacing)), item["attach_nn_counts"].shape[1] - 1)
     cumulative = np.cumsum(item["attach_nn_counts"][:, :max_sites + 1], axis=1)
-    fractions = cumulative / np.maximum(item["attach_events"][:, None], 1)
+    fractions = cumulative / np.maximum(item["attach_with_ref"][:, None], 1)
     mean, sem = _mean_sem(fractions)
     return np.arange(max_sites + 1) * spacing, mean, sem
 
 
+def attach_enrichment(item, max_nm=40.0):
+    """
+    Observed over expected number of first-head attachments within d nm of a bound head, where the
+    expectation assumes each attachment picked a free site uniformly (no steric effect) given the
+    occupancy at that moment. 1 means no steric effect and 0 means none land that close, whatever the
+    density. Per seed, then mean and standard error; a seed is left out at a distance where fewer than one
+    attachment was expected. Returns (distance_nm, mean, sem).
+    """
+    spacing = item["site_spacing"]
+    max_sites = min(int(round(max_nm / spacing)), item["attach_nn_counts"].shape[1] - 1)
+    observed = np.cumsum(item["attach_nn_counts"][:, :max_sites + 1], axis=1)
+    expected = item["attach_expected"][:, :max_sites + 1]
+    ratio = np.where(expected >= 1.0, observed / np.where(expected >= 1.0, expected, 1.0), np.nan)
+    mean, sem = _mean_sem(ratio)
+    return np.arange(max_sites + 1) * spacing, mean, sem
+
+
 def summarize(results, near_nm=(8.0, 16.0)):
-    """One row per setting: final count, runtime, attachments, and the fraction landing near a bound head."""
+    """One row per setting: final count, runtime, attachments, and how first heads land near a bound head."""
     rows = []
     for (range_nm, mode), item in sorted(results.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         row = dict(range_nm=range_nm, mode=mode, seeds=len(item["seed"]))
@@ -334,6 +467,8 @@ def summarize(results, near_nm=(8.0, 16.0)):
         for nm in near_nm:
             d, mean, sem = attach_fraction_within(item, max_nm=nm)
             row[f"attach_within_{nm:g}nm_mean"], row[f"attach_within_{nm:g}nm_sem"] = float(mean[-1]), float(sem[-1])
+            d, mean, sem = attach_enrichment(item, max_nm=nm)
+            row[f"attach_enrichment_{nm:g}nm_mean"], row[f"attach_enrichment_{nm:g}nm_sem"] = float(mean[-1]), float(sem[-1])
         rows.append(row)
     return rows
 
@@ -442,7 +577,7 @@ def plot_pair_profiles(results, bin_nm=4.0, max_nm=64.0):
                 x, mean, sem = pair_correlation(item, bin_nm, max_nm)
                 _band(ax, x, mean, sem, range_color(r, ranges), MODE_LINESTYLE[mode])
         _style(ax, "Distance between two heads on the same lane (nm)",
-               "Pair density relative to uniform, g(d)" if mode == "graded" else None, MODE_TITLE[mode])
+               "Pair density vs uniform in the overlap, g(d)" if mode == "graded" else None, MODE_TITLE[mode])
         ax.set_xlim(0, max_nm)
         ax.set_ylim(bottom=0)
     _legend(fig, results)
@@ -450,21 +585,26 @@ def plot_pair_profiles(results, bin_nm=4.0, max_nm=64.0):
 
 
 def plot_attach_profiles(results, max_nm=40.0):
-    """Empirical binding profile: fraction of first-head attachments landing within d of a bound head."""
+    """
+    Empirical binding profile: observed over expected number of first-head attachments within d of a bound
+    head, where expected assumes uniform binding at the same occupancy. 1 = no steric effect, whatever the
+    density, so the steric-off line should sit at 1.
+    """
     fig, axes = _new_figure()
     ranges = _positive_ranges(results)
     base = results.get((0.0, "off"))
     for ax, mode in zip(axes, ("graded", "hard")):
+        ax.axhline(1.0, color=GRID, linewidth=1.4, zorder=0)
         if base is not None:
-            x, mean, sem = attach_fraction_within(base, max_nm)
+            x, mean, sem = attach_enrichment(base, max_nm)
             _band(ax, x, mean, sem, BASELINE_COLOR, alpha=0.14, zorder=1)
         for r in ranges:
             item = results.get((r, mode))
             if item is not None:
-                x, mean, sem = attach_fraction_within(item, max_nm)
+                x, mean, sem = attach_enrichment(item, max_nm)
                 _band(ax, x, mean, sem, range_color(r, ranges), MODE_LINESTYLE[mode])
         _style(ax, "Distance to the nearest bound head (nm)",
-               "Fraction of new first heads within d" if mode == "graded" else None, MODE_TITLE[mode])
+               "New first heads within d, observed / expected" if mode == "graded" else None, MODE_TITLE[mode])
         ax.set_xlim(0, max_nm)
         ax.set_ylim(bottom=0)
     _legend(fig, results)
@@ -521,12 +661,13 @@ def make_figures(results_dir=DEFAULT_OUT, out_dir=None):
 
 def print_summary(results):
     print(f"{'range_nm':>8} {'mode':>7} {'seeds':>5} {'n_final':>14} {'runtime_s':>12} "
-          f"{'attach<=8nm':>13} {'attach<=16nm':>13}")
+          f"{'attach<=8nm':>13} {'obs/exp 8nm':>13} {'obs/exp 16nm':>13}")
     for r in summarize(results):
         print(f"{r['range_nm']:8.1f} {r['mode']:>7} {r['seeds']:5d} "
               f"{r['n_final_mean']:7.1f}+-{r['n_final_sem']:4.1f} {r['runtime_s_mean']:6.2f}+-{r['runtime_s_sem']:4.2f} "
               f"{r['attach_within_8nm_mean']:7.3f}+-{r['attach_within_8nm_sem']:5.3f} "
-              f"{r['attach_within_16nm_mean']:7.3f}+-{r['attach_within_16nm_sem']:5.3f}")
+              f"{r['attach_enrichment_8nm_mean']:7.2f}+-{r['attach_enrichment_8nm_sem']:4.2f} "
+              f"{r['attach_enrichment_16nm_mean']:7.2f}+-{r['attach_enrichment_16nm_sem']:4.2f}")
 
 
 def main(argv=None):
@@ -549,14 +690,15 @@ def main(argv=None):
 
     if args.command == "run":
         cfg = SweepConfig()
-        if args.ranges: cfg.ranges_nm = tuple(args.ranges)
-        if args.modes: cfg.modes = tuple(args.modes)
-        if args.seeds: cfg.seeds = tuple(range(args.seeds))
-        if args.end_time: cfg.end_time = args.end_time
-        if args.max_steps: cfg.max_steps = args.max_steps
-        if args.binding_rate: cfg.rates = dict(cfg.rates, initial_binding_rate_per_site=args.binding_rate)
-        if args.length: cfg.lattice = dict(cfg.lattice, microtubule_length=args.length)
+        if args.ranges is not None: cfg.ranges_nm = tuple(args.ranges)
+        if args.modes is not None: cfg.modes = tuple(args.modes)
+        if args.seeds is not None: cfg.seeds = tuple(range(args.seeds))
+        if args.end_time is not None: cfg.end_time = args.end_time
+        if args.max_steps is not None: cfg.max_steps = args.max_steps
+        if args.binding_rate is not None: cfg.rates = dict(cfg.rates, initial_binding_rate_per_site=args.binding_rate)
+        if args.length is not None: cfg.lattice = dict(cfg.lattice, microtubule_length=args.length)
         if args.offset is not None: cfg.lattice = dict(cfg.lattice, microtubule_offset=args.offset)
+        cfg.validate()
         print(f"running {len(cfg.settings())} settings x {len(cfg.seeds)} seeds")
         run_sweep(cfg, args.out)
     else:

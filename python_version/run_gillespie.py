@@ -12,11 +12,6 @@ def run_gillespie_prc1(initial_binding_rate_per_site, singly_bound_detachment_ra
                        steric_range_nm=0.0, steric_contact_factor=0.0, steric_decay_nm=None,
                        steric_mode="graded"):
 
-    # steric blocking (off when steric_range_nm == 0) currently covers single-head binding only
-    if steric_range_nm > 0 and enable_hopping:
-        raise ValueError("steric blocking does not yet support hopping; pass enable_hopping=False "
-                         "(hopping can move a head inside another head's steric range)")
-
     # define (initial) state params
     microtubule_length = 5000.
     site_spacing = 0.2
@@ -36,6 +31,12 @@ def run_gillespie_prc1(initial_binding_rate_per_site, singly_bound_detachment_ra
     initial_state = State(*params, steric_range_nm=steric_range_nm,
                           steric_contact_factor=steric_contact_factor,
                           steric_decay_nm=steric_decay_nm, steric_mode=steric_mode)
+
+    # Steric blocking (off when steric_range_nm resolves to 0 sites) covers single-head binding only. Only
+    # enable_hopping == "slow" or "fast" makes heads hop; True is a no-op (ISSUES.md, issue 4), so it is allowed.
+    if initial_state.steric_active and enable_hopping in ("slow", "fast"):
+        raise ValueError("steric blocking does not yet support hopping (enable_hopping='slow' or 'fast'): "
+                         "hopping can move a head inside another head's steric range")
     # end_time = 10
 
     # returns (single attach rates, double attach rates, detach rates, hop bottom rates, hop top rates)
