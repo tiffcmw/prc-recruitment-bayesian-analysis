@@ -8,7 +8,14 @@ import numpy as np
 def run_gillespie_prc1(initial_binding_rate_per_site, singly_bound_detachment_rate,
                        base_double_attachment_rate, base_double_detachment_rate,
                        end_time=1, cooperativity_energy=0, enable_cooperativity=False,
-                       enable_hopping=False, max_steps=np.inf):
+                       enable_hopping=False, max_steps=np.inf,
+                       steric_range_nm=0.0, steric_contact_factor=0.0, steric_decay_nm=None,
+                       steric_mode="graded"):
+
+    # steric blocking (off when steric_range_nm == 0) currently covers single-head binding only
+    if steric_range_nm > 0 and enable_hopping:
+        raise ValueError("steric blocking does not yet support hopping; pass enable_hopping=False "
+                         "(hopping can move a head inside another head's steric range)")
 
     # define (initial) state params
     microtubule_length = 5000.
@@ -26,7 +33,9 @@ def run_gillespie_prc1(initial_binding_rate_per_site, singly_bound_detachment_ra
               cooperativity_energy, enable_cooperativity)
 
     # define gillespie params and funcs
-    initial_state = State(*params)
+    initial_state = State(*params, steric_range_nm=steric_range_nm,
+                          steric_contact_factor=steric_contact_factor,
+                          steric_decay_nm=steric_decay_nm, steric_mode=steric_mode)
     # end_time = 10
 
     # returns (single attach rates, double attach rates, detach rates, hop bottom rates, hop top rates)
@@ -93,7 +102,9 @@ def run_gillespie_prc1(initial_binding_rate_per_site, singly_bound_detachment_ra
 
 def run_gillespie_prc1_on_grid(initial_binding_rate, singly_bound_detachment_rate, base_double_attachment_rate,
                                base_double_detachment_rate, times_obs, cooperativity_energy=0,
-                               enable_cooperativity=False, enable_hopping=True, max_steps=200_000):
+                               enable_cooperativity=False, enable_hopping=True, max_steps=200_000,
+                               steric_range_nm=0.0, steric_contact_factor=0.0, steric_decay_nm=None,
+                               steric_mode="graded"):
     """
     Runs the *same* spatial PRC1 Gillespie model, but only records the observable y(t)=len(state)
     on the user-supplied observation grid times_obs (previous-value / right-continuous sampling).
@@ -117,7 +128,9 @@ def run_gillespie_prc1_on_grid(initial_binding_rate, singly_bound_detachment_rat
     statistics, times = run_gillespie_prc1(initial_binding_rate, singly_bound_detachment_rate, 
                                            base_double_attachment_rate, base_double_detachment_rate,
                                            end_time = times_obs[-1], cooperativity_energy=cooperativity_energy,
-                                           enable_cooperativity=enable_cooperativity, enable_hopping=enable_hopping, max_steps=max_steps)   
+                                           enable_cooperativity=enable_cooperativity, enable_hopping=enable_hopping, max_steps=max_steps,
+                                           steric_range_nm=steric_range_nm, steric_contact_factor=steric_contact_factor,
+                                           steric_decay_nm=steric_decay_nm, steric_mode=steric_mode)
     # statistics is a list of len(state) at each timepoint, times is a list of timepoints
     stats_obs = []
     for time in times_obs:

@@ -2,45 +2,155 @@
 # precompute attachment rates for different offsets?
 # make sure to check that there is an available spot when attaching
 
+import math
+import warnings
+
 import numpy as np
 from sortedcontainers import SortedList, SortedSet
 from prc1 import Prc1
 from copy import deepcopy
 
+
+def range_nm_to_sites(range_nm, site_spacing):
+    """
+    The single place where a steric interaction range in nm becomes a whole number of lattice sites.
+
+    Rounds down (with a tolerance for floating point error, so 0.6 nm at 0.2 nm spacing is 3 sites).
+    A positive range smaller than one site is NOT rounded up to a one-site effect: it warns and
+    returns 0 (feature off), so the caller knows the lattice cannot resolve that range.
+    """
+    if range_nm < 0:
+        raise ValueError(f"steric range must be non-negative, got {range_nm} nm")
+    if range_nm == 0:
+        return 0
+    sites = int(math.floor(range_nm / site_spacing + 1e-9))
+    if sites < 1:
+        warnings.warn(f"steric range {range_nm} nm is below one site (site spacing {site_spacing} nm); "
+                      "steric blocking is disabled", UserWarning, stacklevel=3)
+        return 0
+    return sites
+
+
+class StericField:
+    """
+    Per-lane bookkeeping for distance-dependent steric blocking of single-head binding.
+
+    weight[i] is the product of factors[|i - j|] over occupied sites j within range_sites of i
+    (factors[k] == 0 means a hard block, tracked in blocked[i] so it can be undone exactly).
+    A site contributes weight[i] to `total` only while it is free and unblocked, so
+    total * rate_per_site is the lane's single-head binding propensity. Occupying or releasing a
+    site touches at most 2 * range_sites neighbors, so an update is O(range_sites).
+    """
+    RESYNC_EVERY = 100_000   # recompute `total` from scratch to cancel floating point drift
+
+    def __init__(self, num_sites, range_sites, factors):
+        self.num_sites = num_sites
+        self.range_sites = range_sites
+        self.factors = factors             # factors[k] for k = 1..range_sites (index 0 unused)
+        self.weight = [1.0] * num_sites
+        self.blocked = [0] * num_sites     # number of hard blockers within range
+        self.neighbors = [0] * num_sites   # number of occupied sites within range
+        self.taken = [False] * num_sites
+        self.total = float(num_sites)
+        self._updates = 0
+
+    def site_weight(self, site):
+        if self.taken[site] or self.blocked[site]:
+            return 0.0
+        return self.weight[site]
+
+    def occupy(self, site):
+        weight, blocked, neighbors, factors = self.weight, self.blocked, self.neighbors, self.factors
+        total = self.total - self.site_weight(site)
+        self.taken[site] = True
+        for i in range(max(0, site - self.range_sites), min(self.num_sites, site + self.range_sites + 1)):
+            if i == site:
+                continue
+            f = factors[abs(i - site)]
+            if not self.taken[i]:
+                total -= 0.0 if blocked[i] else weight[i]
+            if f == 0.0:
+                blocked[i] += 1
+            else:
+                weight[i] *= f
+            neighbors[i] += 1
+            if not self.taken[i]:
+                total += 0.0 if blocked[i] else weight[i]
+        self.total = total
+        self._after_update()
+
+    def release(self, site):
+        weight, blocked, neighbors, factors = self.weight, self.blocked, self.neighbors, self.factors
+        total = self.total
+        self.taken[site] = False
+        for i in range(max(0, site - self.range_sites), min(self.num_sites, site + self.range_sites + 1)):
+            if i == site:
+                continue
+            f = factors[abs(i - site)]
+            if not self.taken[i]:
+                total -= 0.0 if blocked[i] else weight[i]
+            if f == 0.0:
+                blocked[i] -= 1
+            else:
+                weight[i] /= f
+            neighbors[i] -= 1
+            if neighbors[i] == 0:
+                weight[i] = 1.0   # no neighbors left: reset exactly instead of carrying rounding error
+            if not self.taken[i]:
+                total += 0.0 if blocked[i] else weight[i]
+        self.total = total + self.site_weight(site)
+        self._after_update()
+
+    def _after_update(self):
+        self._updates += 1
+        if self._updates >= self.RESYNC_EVERY:
+            self._updates = 0
+            self.total = math.fsum(self.site_weight(i) for i in range(self.num_sites))
+
+
 class SortedSetAndComplement(SortedSet):
     """
-    helper class to maintain a set and its complement, and also the numbers 
+    helper class to maintain a set and its complement, and also the numbers
     one more and less than the values in the set (for cooperativity calculations)
     """
-    def __init__(self, universal_set):
+    def __init__(self, universal_set, steric=None):
         """
         Initialized to empty, with complement as the full universal set
 
         :param universal_set: iterable of all possible values in the set
+        :param steric: optional StericField kept in sync with the set (None when steric blocking is off)
         """
         super().__init__(self)
         self.complement = SortedSet(universal_set)
         self.single_adjacencies = SortedSet()
         self.double_adjacencies = SortedSet()
-    
+        self.steric = steric
+
     def add(self, value):
         # self.current_set.add(value)
         if value in self or value is None: return
         SortedSet.add(self, value)
         self.complement.discard(value)
         self.update_adjacencies(value)
-    
+        if self.steric is not None:
+            self.steric.occupy(value)
+
     def remove(self, value):
         if value is None: return
         SortedSet.remove(self, value)
         self.complement.add(value)
         self.update_adjacencies(value)
+        if self.steric is not None:
+            self.steric.release(value)
 
     def discard(self, value):
         if value is None: return
+        was_member = value in self
         SortedSet.discard(self, value)
         self.complement.add(value)
         self.update_adjacencies(value)
+        if was_member and self.steric is not None:
+            self.steric.release(value)
 
     def update_adjacencies(self, value):
         values = [value-2, value-1, value, value+1, value+2]
@@ -81,7 +191,17 @@ class State:
                  rest_length, k_B_T, microtubule_separation, initial_binding_rate_per_site,
                  singly_bound_detachment_rate, base_double_attachment_rate,
                  base_double_detachment_rate, base_hopping_rate,
-                 cooperativity_energy=0, enable_cooperativity=False):
+                 cooperativity_energy=0, enable_cooperativity=False,
+                 steric_range_nm=0.0, steric_contact_factor=0.0, steric_decay_nm=None,
+                 steric_mode="graded"):
+        """
+        Steric blocking of single-head binding (off by default, steric_range_nm=0):
+        a free site's binding weight is the product, over occupied sites j on the same lane within
+        steric_range_nm, of f(d) with d the distance in nm. "graded": f(d) = 1 - (1 - contact_factor)
+        * exp(-d / decay), decay defaulting to steric_range_nm / 3. "hard": f(d) = 0 inside the range.
+        The range is converted to sites by range_nm_to_sites and exposed as steric_range_sites.
+        Currently not combinable with cooperativity (see ISSUES.md).
+        """
         
         # fit params
         self.singly_bound_detachment_rate = singly_bound_detachment_rate
@@ -115,9 +235,25 @@ class State:
         self.site_spacing = site_spacing
         self.num_sites = int(microtubule_length / site_spacing) + 1
 
+        # steric blocking parameters (range in nm, converted to sites in one place)
+        if steric_mode not in ("graded", "hard"):
+            raise ValueError(f"steric_mode must be 'graded' or 'hard', got {steric_mode!r}")
+        if not 0.0 <= steric_contact_factor <= 1.0:
+            raise ValueError(f"steric_contact_factor must be in [0, 1], got {steric_contact_factor}")
+        if steric_decay_nm is not None and steric_decay_nm <= 0:
+            raise ValueError(f"steric_decay_nm must be positive, got {steric_decay_nm}")
+        self.steric_range_nm = steric_range_nm
+        self.steric_mode = steric_mode
+        self.steric_contact_factor = steric_contact_factor
+        self.steric_decay_nm = steric_range_nm / 3.0 if steric_decay_nm is None else steric_decay_nm
+        self.steric_range_sites = range_nm_to_sites(steric_range_nm, site_spacing)
+        if self.steric_range_sites > 0 and enable_cooperativity:
+            raise ValueError("steric blocking cannot yet be combined with cooperativity; "
+                             "set enable_cooperativity=False or steric_range_nm=0")
+
         # keep track of taken (and untaken) sites for fast lookup
-        self.top_taken_sites = SortedSetAndComplement(range(self.num_sites))
-        self.bottom_taken_sites = SortedSetAndComplement(range(self.num_sites))
+        self.top_taken_sites = self.__new_taken_sites()
+        self.bottom_taken_sites = self.__new_taken_sites()
 
         # self.prc1_set = SortedSet()
         self.doubly_attached_prc1 = SortedSet()
@@ -155,9 +291,60 @@ class State:
         double_cooperativity_rate = self.initial_binding_rate_per_site * np.exp(self.cooperativity_energy / self.k_B_T)
         return num_doubly_adjacent_sites * double_cooperativity_rate
 
+    # steric blocking
+    @property
+    def steric_active(self):
+        return self.steric_range_sites > 0
+
+    def __new_taken_sites(self):
+        """an empty per-lane taken-site set, with a StericField attached when steric blocking is on"""
+        steric = None
+        if self.steric_active:
+            if self.steric_mode == "hard":
+                factors = [0.0] * (self.steric_range_sites + 1)
+            else:
+                factors = [1.0 - (1.0 - self.steric_contact_factor)
+                           * math.exp(-k * self.site_spacing / self.steric_decay_nm)
+                           for k in range(self.steric_range_sites + 1)]
+            steric = StericField(self.num_sites, self.steric_range_sites, factors)
+        return SortedSetAndComplement(range(self.num_sites), steric)
+
+    def __steric_field(self, lane):
+        if not self.steric_active:
+            raise RuntimeError("steric blocking is off (steric_range_nm resolves to 0 sites)")
+        return (self.bottom_taken_sites if lane == "bottom" else self.top_taken_sites).steric
+
+    def steric_weight(self, lane, site):
+        """binding weight in [0, 1] of `site` on `lane` ("bottom" or "top"); 0 if taken or hard-blocked"""
+        return self.__steric_field(lane).site_weight(site)
+
+    def steric_total(self, lane):
+        """sum of steric weights over the free sites of `lane`"""
+        return self.__steric_field(lane).total
+
+    def sample_binding_site(self, lane):
+        """
+        Draw a free site on `lane` with probability proportional to its steric weight, by rejection
+        (weights are at most 1, so accepting with probability weight is exact). The two RNG draws use
+        np.random so that np.random.seed keeps the whole simulation reproducible.
+        """
+        field = self.__steric_field(lane)
+        if field.total <= 0:
+            raise RuntimeError(f"no {lane} site is available under steric blocking")
+        untaken = (self.bottom_taken_sites if lane == "bottom" else self.top_taken_sites).complement
+        num_untaken = len(untaken)
+        while True:
+            site = untaken[int(np.random.random() * num_untaken)]
+            if np.random.random() < field.site_weight(site):
+                return site
+
     @property
     def uncooperative_initial_binding_rates(self):
         """(bottom binding rate, top binding rate)"""
+        if self.steric_active:
+            # cooperativity is rejected in __init__ when steric blocking is on
+            return np.array([max(self.bottom_taken_sites.steric.total, 0.0),
+                             max(self.top_taken_sites.steric.total, 0.0)]) * self.initial_binding_rate_per_site
         num_total_sites = self.num_sites  # sites per lane; rates below are per lane
         num_taken_sites = np.array([len(self.bottom_taken_sites), len(self.top_taken_sites)])
 
@@ -204,8 +391,8 @@ class State:
     # BASIC OPERATIONS
 
     def clear(self):
-        self.top_taken_sites = SortedSetAndComplement(range(self.num_sites))
-        self.bottom_taken_sites = SortedSetAndComplement(range(self.num_sites))
+        self.top_taken_sites = self.__new_taken_sites()
+        self.bottom_taken_sites = self.__new_taken_sites()
         self.top_attached_prc1.clear()
         self.bottom_attached_prc1.clear()
         self.doubly_attached_prc1.clear()
@@ -267,7 +454,9 @@ class State:
             bottom_rate, top_rate = self.uncooperative_initial_binding_rates
             probabilities = np.array([bottom_rate, top_rate]) / (bottom_rate + top_rate)
             attachment_head_bottom = np.random.choice([True, False], p=probabilities)
-            if attachment_head_bottom:
+            if self.steric_active:
+                site = self.sample_binding_site("bottom" if attachment_head_bottom else "top")
+            elif attachment_head_bottom:
                 site = np.random.choice(self.bottom_untaken_sites)
             else:
                 site = np.random.choice(self.top_untaken_sites)
