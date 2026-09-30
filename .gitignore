@@ -24,3 +24,5 @@ sequentialwrapper.ipynb
 python_version/__pycache__/
 python_version/.ipynb_checkpoints/
 documentation/
+# generated sweep data and figures
+results/steric_sweep/

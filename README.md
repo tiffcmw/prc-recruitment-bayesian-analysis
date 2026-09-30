@@ -30,6 +30,8 @@ Pass `steric_range_nm` to `run_gillespie_prc1` or `run_gillespie_prc1_on_grid` t
 - `steric_mode="graded"` (default): each occupied neighbor at distance d multiplies the weight by `1 - (1 - steric_contact_factor) * exp(-d / steric_decay_nm)`. `steric_decay_nm` defaults to `steric_range_nm / 3`, and `steric_contact_factor` defaults to 0 and is the limit as d approaches 0 (the nearest reachable site is one site spacing away, so its weight is larger).
 - `steric_mode="hard"`: sites within the range of an occupied site cannot be bound.
 
+To sweep the range and plot the results, run `python python_version/steric_sweep.py run` (saves one `.npz` per setting under `results/steric_sweep/`, gitignored) and `python python_version/steric_sweep.py plot` (redraws figures from the saved files without simulating). See `notebooks/steric_blocking_demo.ipynb` for a short walkthrough and `reports/steric_blocking_report.md` for the write-up.
+
 The distance law is a working hypothesis, not a literature result. It currently applies to single-head binding only, and cannot be combined with cooperativity or hopping (pass `enable_hopping=False`; `run_gillespie_prc1_on_grid` defaults to hopping on). See ISSUES.md, issue 3.
 
 ## Testing
