@@ -155,7 +155,7 @@ class State:
     @property
     def uncooperative_initial_binding_rates(self):
         """(bottom binding rate, top binding rate)"""
-        num_total_sites = self.num_sites * 2  # times 2 because top and bottom
+        num_total_sites = self.num_sites  # sites per lane; rates below are per lane
         num_taken_sites = np.array([len(self.bottom_taken_sites), len(self.top_taken_sites)])
 
         if not self.enable_cooperativity:
@@ -386,8 +386,8 @@ class State:
         else:
             self.last_reaction = "double detach"
             self.last_reaction_prc1 = str(prc1)
-            bottom_rate = prc1.top_detachment_rate
-            top_rate = prc1.bottom_detachment_rate
+            bottom_rate = prc1.bottom_detachment_rate
+            top_rate = prc1.top_detachment_rate
             probabilities = np.array([bottom_rate, top_rate]) / (bottom_rate + top_rate)
             if detach_bottom_head == None:
                 detach_bottom_head = np.random.choice([True, False], p=probabilities)
