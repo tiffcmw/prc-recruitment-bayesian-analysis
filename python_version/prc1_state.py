@@ -133,6 +133,9 @@ class State:
     # initial attachment rate
     @property
     def initial_binding_rate(self):
+        if not self.enable_cooperativity:
+            # the uncooperative rates already cover every untaken site, adjacent ones included
+            return sum(self.uncooperative_initial_binding_rates)
         return (  sum(self.uncooperative_initial_binding_rates)
                 + sum(self.singly_adjacent_cooperative_initial_binding_rates)
                 + sum(self.doubly_adjacent_cooperative_initial_binding_rates))
