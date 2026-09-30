@@ -8,6 +8,7 @@ Model under test (a working hypothesis, not a settled result):
 with d_nm = d_sites * site_spacing. The range is given in nm and converted to sites by
 range_nm_to_sites(). Default range is 0 nm, which switches the feature off.
 """
+import copy
 import math
 import warnings
 
@@ -338,3 +339,93 @@ def test_steric_with_hopping_is_rejected_for_now(hopping):
 def test_invalid_parameters_are_rejected(bad):
     with pytest.raises(ValueError):
         make_state(steric_range_nm=5.0, **bad)
+
+
+@pytest.mark.parametrize("bad_range", [float("nan"), float("inf")])
+def test_non_finite_range_is_rejected(bad_range):
+    with pytest.raises(ValueError):
+        range_nm_to_sites(bad_range, 0.2)
+
+
+# ---------------------------------------------------------------- regressions found in review
+
+@pytest.mark.parametrize("range_nm", [0.0, 5.0])
+def test_taken_sites_deepcopy_is_correct_and_independent(range_nm):
+    """
+    SortedSet.__reduce__ rebuilds a subclass as cls(set, key). With the optional `steric`
+    argument that call used to succeed and silently produce a set with the wrong complement
+    (the taken set became the universe) and no StericField.
+    """
+    np.random.seed(0)
+    state = make_state(steric_range_nm=range_nm, site_spacing=1.0)
+    for _ in range(4):
+        state.single_attach_prc1()
+    for original in (state.bottom_taken_sites, state.top_taken_sites):
+        clone = copy.deepcopy(original)
+        assert list(clone) == list(original)
+        assert list(clone.complement) == list(original.complement)
+        assert list(clone.single_adjacencies) == list(original.single_adjacencies)
+        assert (clone.steric is None) == (original.steric is None)
+        if range_nm > 0:
+            assert clone.steric is not original.steric
+            assert clone.steric.total == pytest.approx(original.steric.total)
+            assert clone.steric.weight == original.steric.weight
+            free = original.complement[0]
+            clone.add(free)
+            assert free not in original and free in clone   # the copy is independent
+            assert clone.steric.total < original.steric.total
+
+
+def test_full_lane_gives_zero_rate_and_a_clear_error_in_graded_mode():
+    state = make_state(microtubule_length=9.0, site_spacing=1.0, steric_range_nm=2.0)
+    for site in range(state.num_sites):
+        occupy(state, "bottom", site)
+    assert state.steric_total("bottom") == 0.0            # exactly zero, not ~1e-15
+    assert state.uncooperative_initial_binding_rates[0] == 0.0
+    with pytest.raises(RuntimeError):
+        state.sample_binding_site("bottom")
+
+
+@pytest.mark.parametrize("mode", ["graded", "hard"])
+def test_total_returns_exactly_to_num_sites_when_lane_empties(mode):
+    np.random.seed(2)
+    state = make_state(steric_range_nm=5.0, site_spacing=1.0, steric_mode=mode)
+    heads = [occupy(state, "bottom", s) for s in (10, 12, 40, 41, 90)]
+    for prc1 in heads:
+        state.detach_prc1(state.index(prc1))
+    assert state.steric_total("bottom") == state.num_sites
+
+
+def test_periodic_resync_keeps_total_consistent(monkeypatch):
+    from prc1_state import StericField
+    monkeypatch.setattr(StericField, "RESYNC_EVERY", 3)
+    np.random.seed(4)
+    state = make_state(steric_range_nm=5.0, site_spacing=1.0)
+    for _ in range(40):
+        if state.num_prc1 == 0 or np.random.random() < 0.6:
+            state.single_attach_prc1()
+        else:
+            state.detach_prc1(np.random.randint(state.num_prc1))
+    factor_at = lambda k: graded_factor(k, 1.0, 5.0)
+    for lane in LANES:
+        assert state.steric_total(lane) == pytest.approx(
+            sum(brute_force_weight(state, lane, s, factor_at) for s in range(state.num_sites)), abs=1e-9)
+
+
+def test_state_level_hopping_is_rejected_when_steric_is_on():
+    state = make_state(steric_range_nm=5.0, site_spacing=1.0)
+    occupy(state, "bottom", 100)
+    with pytest.raises(NotImplementedError, match="hopping"):
+        state.fast_hop()
+    with pytest.raises(NotImplementedError, match="hopping"):
+        state.hop_bottom(0)
+    with pytest.raises(NotImplementedError, match="hopping"):
+        state.hop_top(0)
+
+
+def test_nearest_site_weight_is_not_the_contact_factor():
+    # contact_factor is the d -> 0 limit; the nearest reachable site is one spacing away.
+    state = make_state(steric_range_nm=5.0, site_spacing=1.0, steric_contact_factor=0.2)
+    occupy(state, "bottom", 100)
+    assert state.steric_weight("bottom", 101) == pytest.approx(graded_factor(1, 1.0, 5.0, contact=0.2))
+    assert state.steric_weight("bottom", 101) > 0.2
